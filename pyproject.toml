@@ -20,9 +20,10 @@ dependencies = [
 cuda = ["cupy-cuda12x>=13.0"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 # matplotlib is dev-only, used to regenerate docs/book_figures/*.py's plots
-# for the tutorial book (docs/BOOK.md pointer) -- never imported by
-# spectracuda itself.
-docs = ["matplotlib>=3.8"]
+# for the tutorial book; sphinx/myst-parser/sphinx-rtd-theme build the
+# published site (spectracuda.readthedocs.io, see docs/conf.py) -- none of
+# this is ever imported by spectracuda itself.
+docs = ["matplotlib>=3.8", "sphinx>=7.0", "myst-parser>=2.0", "sphinx-rtd-theme>=2.0", "sphinx-copybutton>=0.5"]
 
 [tool.setuptools.packages.find]
 include = ["spectracuda*"]

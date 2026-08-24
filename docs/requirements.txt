@@ -1,0 +1,7 @@
+# Docs-build-only dependencies (Read the Docs installs these via
+# .readthedocs.yaml -- never a runtime dependency of spectracuda itself,
+# same boundary pyproject.toml's own `docs` extra already draws).
+sphinx>=7.0
+myst-parser>=2.0
+sphinx-rtd-theme>=2.0
+sphinx-copybutton>=0.5

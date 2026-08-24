@@ -11,3 +11,7 @@ venv/
 # Cloned as a correctness-oracle reference, not part of the shipped
 # package (see docs/architecture.md) -- not tracked in this repo.
 /reference/liquid-dsp/
+
+# Sphinx build output (spectracuda.readthedocs.io builds this itself) --
+# regenerate locally with `.venv/bin/python -m sphinx -b html docs docs/_build/html`.
+/docs/_build/

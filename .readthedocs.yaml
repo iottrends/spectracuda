@@ -1,0 +1,16 @@
+# Read the Docs build config: https://docs.readthedocs.io/en/stable/config-file/v2.html
+# Publishes to spectracuda.readthedocs.io on every push to main (once the
+# project is imported at readthedocs.org -- see README.md's docs section).
+version: 2
+
+build:
+  os: ubuntu-22.04
+  tools:
+    python: "3.11"
+
+sphinx:
+  configuration: docs/conf.py
+
+python:
+  install:
+    - requirements: docs/requirements.txt
