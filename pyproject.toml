@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectracuda"
+version = "0.0.1"
+description = "GPU-accelerated, liquid-dsp-inspired SDR PHY framework for NVIDIA Jetson"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+# Install on the Jetson / any CUDA-capable machine. Pin the cupy variant
+# to match the target CUDA toolkit version once JetPack version is known.
+cuda = ["cupy-cuda12x>=13.0"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+# matplotlib is dev-only, used to regenerate docs/book_figures/*.py's plots
+# for the tutorial book (docs/BOOK.md pointer) -- never imported by
+# spectracuda itself.
+docs = ["matplotlib>=3.8"]
+
+[tool.setuptools.packages.find]
+include = ["spectracuda*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

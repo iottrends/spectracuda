@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+.venv/
+venv/
+
+# Cloned as a correctness-oracle reference, not part of the shipped
+# package (see docs/architecture.md) -- not tracked in this repo.
+/reference/liquid-dsp/
