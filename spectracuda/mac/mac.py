@@ -213,24 +213,48 @@ class Mac:
 
         Shared by receive_iq() and the bind/quality IQ handlers below --
         all of them need this exact rx_process/quality/failure-handling
-        logic, not four separate copies of it."""
-        iq_array = np.asarray(iq_array)
+        logic, not four separate copies of it.
+
+        A real bug lived here until caught on actual CUDA hardware (a
+        Colab Tesla T4, 2026-08-25): this used to run every value below
+        through plain `np.asarray(...)`, which CuPy deliberately raises
+        TypeError on ("implicit conversion to a NumPy array is not
+        allowed") rather than silently doing a slow, unrequested
+        device->host copy -- exactly what a numpy-only dev machine can
+        never catch, since numpy's own asarray() is always a no-op on an
+        already-numpy array. `self.ofdm.rx_process()`'s inputs/outputs
+        live on `self.ofdm`'s own backend (genuinely cupy.ndarray when
+        backend="cupy"), so iq_array is now passed straight through
+        un-coerced (rx_process() does its own xp.asarray() internally,
+        correctly handling either backend), and every value actually
+        read out of `result` goes through self._to_host() first."""
         try:
             result = self.ofdm.rx_process(iq_array)
         except (ValueError, NotImplementedError):
             return None
         crc_valid = result["crc_valid"]
-        delivered = bool(result["frame_found"]) and (crc_valid is None or bool(np.asarray(crc_valid)[0]))
+        delivered = bool(result["frame_found"]) and (crc_valid is None or bool(self._to_host(crc_valid)[0]))
         rssi_db = result["rssi_db"]
         evm = result["evm"]
         self.quality.observe(
-            rssi_db=float(np.asarray(rssi_db)[0]),
-            evm=None if evm is None else float(np.asarray(evm)[0]),
+            rssi_db=float(self._to_host(rssi_db)[0]),
+            evm=None if evm is None else float(self._to_host(evm)[0]),
             delivered=delivered,
         )
         if not delivered:
             return None
-        return np.asarray(result["bits"])[0].astype("uint8")
+        return self._to_host(result["bits"])[0].astype("uint8")
+
+    def _to_host(self, arr: Any) -> np.ndarray:
+        """arr may genuinely be a cupy.ndarray (whenever self.ofdm.backend
+        == "cupy") -- cupy.asnumpy() is required there since cupy raises
+        on implicit conversion via plain np.asarray() (see
+        _rx_one_frame's docstring for the real bug this fixes)."""
+        if self.ofdm.backend == "cupy":
+            import cupy
+
+            return cupy.asnumpy(arr)
+        return np.asarray(arr)
 
     def receive_iq(self, iq_array: Any) -> Any:
         """One arrived DATA IQ frame -> whatever self._impl.receive()

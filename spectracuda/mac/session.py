@@ -137,17 +137,29 @@ class MacLink:
             return None
 
         crc_valid = result["crc_valid"]
-        delivered = bool(result["frame_found"]) and (crc_valid is None or bool(np.asarray(crc_valid)[0]))
+        delivered = bool(result["frame_found"]) and (crc_valid is None or bool(self._to_host(crc_valid)[0]))
         rssi_db = result["rssi_db"]
         evm = result["evm"]
         self.quality.observe(
-            rssi_db=float(np.asarray(rssi_db)[0]),
-            evm=None if evm is None else float(np.asarray(evm)[0]),
+            rssi_db=float(self._to_host(rssi_db)[0]),
+            evm=None if evm is None else float(self._to_host(evm)[0]),
             delivered=delivered,
         )
         if not delivered:
             return None
-        return np.asarray(result["bits"])[0].astype("uint8")
+        return self._to_host(result["bits"])[0].astype("uint8")
+
+    def _to_host(self, arr: Any) -> np.ndarray:
+        """arr may genuinely be a cupy.ndarray (whenever self.ofdm.backend
+        == "cupy") -- plain np.asarray() raises on that (CuPy disallows
+        implicit conversion), same real bug and fix as
+        Mac._rx_one_frame() in mac.py -- caught on actual CUDA hardware
+        (Colab Tesla T4, 2026-08-25)."""
+        if self.ofdm.backend == "cupy":
+            import cupy
+
+            return cupy.asnumpy(arr)
+        return np.asarray(arr)
 
     def bind(self) -> bool:
         """The binding handshake (docs/mac.md): send a BIND_REQUEST
