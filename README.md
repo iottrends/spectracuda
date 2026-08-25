@@ -269,6 +269,18 @@ done, what's a deliberate scope boundary, and what's still genuinely
 open, e.g. a not-yet-root-caused long-frame reliability question at small
 `fft_size`, §1.11).
 
+`backend="cupy"` has now actually run on real CUDA hardware (a Colab
+Tesla T4, 2026-08-25) — not just designed against the API, as it was
+before this point. A direct `Ofdm(backend="cupy")` `generate_frame()` →
+`rx_process()` round trip produced genuine `cupy.ndarray` IQ and a
+correct CRC, and the full suite went from 600 passed/1 skipped (skip
+being the one cupy-parametrized test, `tests/conftest.py`'s `backend`
+fixture, with no CUDA runtime to run against) to **601 passed, 0
+skipped** on that GPU. Jetson-specific behavior (actual throughput, the
+CPU-resident stages noted in `docs/architecture.md`) is still
+unvalidated — a T4 on Colab confirms CUDA correctness, not Jetson
+performance.
+
 ## Development
 
 ```sh

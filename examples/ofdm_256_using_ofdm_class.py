@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from spectracuda.backend import default_backend
 from spectracuda.pipeline import Ofdm
 from spectracuda.sim import Channel
 
@@ -17,14 +18,16 @@ FFT_SIZE = 256
 CP_LEN = FFT_SIZE // 8  # 32
 
 
-def run(seed: int = 0, snr_db: float = 25.0, eps_true: float = 0.15, verbose: bool = True):
+def run(seed: int = 0, snr_db: float = 25.0, eps_true: float = 0.15, verbose: bool = True,
+        backend: str = None):
+    backend = backend or default_backend()  # "cupy" if a working CUDA runtime is present, else "numpy"
     ofdm = Ofdm(
         fft_size=FFT_SIZE, n_pilot=6, n_data=200, cp_len=CP_LEN,
         modem="qpsk", fec="none",
         sync="schmidl_cox", cfo="schmidl_cox",
         channel_estimator="ls", equalizer="mmse",
         n_training_symbols=2,
-        backend="numpy",
+        backend=backend,
     )
 
     rng = np.random.default_rng(seed)
@@ -40,7 +43,7 @@ def run(seed: int = 0, snr_db: float = 25.0, eps_true: float = 0.15, verbose: bo
     taps = Channel.random_multipath_taps(3, seed=seed + 1000)
     channel = Channel(
         snr_db=snr_db, multipath_taps=taps, cfo=eps_true, cfo_fft_size=FFT_SIZE,
-        seed=seed + 1000, backend="numpy",
+        seed=seed + 1000, backend=backend,
     )
     rx_iq = channel.process(padded)[0]
 

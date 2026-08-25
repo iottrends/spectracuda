@@ -65,6 +65,13 @@ N_PILOT = 6  # -> n_null = 256 - 200 - 6 = 50 guard/DC subcarriers
 
 
 def run(seed: int = 0, snr_db: float = 25.0, eps_true: float = 0.15, verbose: bool = True) -> Dict[str, Any]:
+    # Deliberately backend="numpy" only, unlike the other examples in this
+    # directory: this file calls grid.extract_data(np, ...) below, passing
+    # the literal numpy module in directly rather than threading self.xp
+    # through -- mixing that with a cupy-backed block's arrays is untested
+    # and not worth risking in this manual, pre-Ofdm-class reference demo
+    # (see ofdm_256_using_ofdm_class.py for the GPU-ready version of this
+    # exact scenario, built through the real Ofdm class instead).
     grid = ResourceGrid(fft_size=FFT_SIZE, n_data=N_DATA, n_pilot=N_PILOT, dc_null=True)
     modem = Modem("qpsk", backend="numpy")
     mod = OfdmModulator(FFT_SIZE, CP_LEN, backend="numpy")

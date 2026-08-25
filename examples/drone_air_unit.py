@@ -37,6 +37,7 @@ import time
 import numpy as np
 import zmq
 
+from spectracuda.backend import default_backend
 from spectracuda.mac import Mac
 from spectracuda.mac.bind import (
     decode_bind_request,
@@ -59,7 +60,7 @@ PHY_KWARGS = dict(
     fec="rs_m8", fec1="conv_v27",
     interleaver="block", interleaver_kwargs={"unit_bits": 8},
     crc="crc16", sync="schmidl_cox", cfo="schmidl_cox",
-    n_training_symbols=2, backend="numpy",
+    n_training_symbols=2, backend=default_backend(),  # "cupy" if a working CUDA runtime is present, else "numpy"
 )
 
 GROUND_TO_AIR_PORT = 5555  # ground PUSH -> air PULL (also carries the bind request)

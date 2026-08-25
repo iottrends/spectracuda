@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from spectracuda.backend import default_backend
 from spectracuda.mac import Mac
 from spectracuda.mac.bind import decode_bind_response, encode_bind_request
 from spectracuda.mac.pdu import (
@@ -45,12 +46,12 @@ _TYPE_NAMES = {
 PHY_A = dict(
     fft_size=64, n_pilot=4, n_data=16, cp_len=16, modem="bpsk",
     crc="crc16", sync="schmidl_cox", cfo="schmidl_cox",
-    n_training_symbols=2, backend="numpy",
+    n_training_symbols=2, backend=default_backend(),  # "cupy" if a working CUDA runtime is present, else "numpy"
 )
 PHY_B = dict(
     fft_size=64, n_pilot=4, n_data=16, cp_len=16, modem="bpsk",
     crc="crc16", sync="schmidl_cox", cfo="schmidl_cox",
-    n_training_symbols=2, backend="numpy",
+    n_training_symbols=2, backend=default_backend(),  # "cupy" if a working CUDA runtime is present, else "numpy"
 )
 
 CHUNK_SIZE = 64  # arbitrary, same as mac_streaming_demo.py
@@ -194,7 +195,7 @@ def run(seed: int = 0, snr_db: float = 40.0, verbose: bool = True):
     hw2_rx_mac.ofdm.reset_stream()
     hw1_rx_mac.ofdm.reset_stream()
 
-    channel = Channel(snr_db=snr_db, seed=seed, backend="numpy")
+    channel = Channel(snr_db=snr_db, seed=seed, backend=default_backend())
     rng = np.random.default_rng(seed)
     sdu_fwd = rng.integers(0, 2, size=4800).astype("uint8")  # hw1 -> hw2
     sdu_rev = rng.integers(0, 2, size=1200).astype("uint8")  # hw2 -> hw1

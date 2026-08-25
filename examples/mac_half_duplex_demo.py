@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import numpy as np
 
+from spectracuda.backend import default_backend
 from spectracuda.mac import Mac
 
 PHY_KWARGS = dict(
     fft_size=256, n_pilot=8, n_data=216, cp_len=32,
     crc="crc16", sync="schmidl_cox", cfo="schmidl_cox",
-    n_training_symbols=2, backend="numpy",
+    n_training_symbols=2, backend=default_backend(),  # "cupy" if a working CUDA runtime is present, else "numpy"
 )
 
 

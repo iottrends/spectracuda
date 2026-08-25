@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import numpy as np
 
+from spectracuda.backend import default_backend
 from spectracuda.mac import Mac
 from spectracuda.sim import Channel
 
+_BACKEND = default_backend()  # "cupy" if a working CUDA runtime is present, else "numpy"
 PHY_KWARGS = dict(
     fft_size=256, n_pilot=8, n_data=216, cp_len=32,
     crc="crc16", sync="schmidl_cox", cfo="schmidl_cox",
-    n_training_symbols=2, backend="numpy",
+    n_training_symbols=2, backend=_BACKEND,
 )
 
 
@@ -49,7 +51,7 @@ def run(seed: int = 0, snr_db: float = 25.0, sdu_bits: int = 800, verbose: bool 
         print(f"derived max_segment_bits (from HW1's Ofdm capacity): {hw1_tx_mac.max_segment_bits}")
 
     sdu = np.random.default_rng(seed).integers(0, 2, size=sdu_bits).astype("uint8")
-    channel = Channel(snr_db=snr_db, seed=seed, backend="numpy")
+    channel = Channel(snr_db=snr_db, seed=seed, backend=_BACKEND)
 
     if verbose:
         print(f"\nsdu ({sdu.shape[0]} bits):\n{sdu}")
