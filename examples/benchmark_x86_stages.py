@@ -25,6 +25,13 @@ timing here patches FEC.decode at the CLASS level (every instance,
 including throwaway ones), bucketed by each call's own self.scheme,
 rather than patching one specific instance and silently timing zero.
 
+Runs with Numba only for the Viterbi (conv_v27) stage -- not the old
+pure-NumPy path side by side with it (see
+prototype_viterbi_numba.py/git history for that comparison and its
+~100x number). The patched FEC.decode() below genuinely calls the
+Numba-JIT decoder as conv_v27's real decode path for this run, not a
+shadow timing next to the original.
+
 Usage:
     python examples/benchmark_x86_stages.py
 """
@@ -69,25 +76,25 @@ def _install_fec_class_patch(timings: dict):
     fec0 (rs_m8) and fec1 (conv_v27) are reported separately. Returns a
     restore function.
 
-    For conv_v27 specifically, also runs the Numba-JIT decode
-    (prototype_viterbi_numba.py) on the SAME bits as a timed side
-    computation -- its result is discarded, never substituted for the
-    real decode's output, so this can't change what actually gets
-    delivered. Only there to put both numbers side by side without
-    needing a second script run."""
+    For conv_v27 specifically, the REAL decode path used here IS the
+    Numba-JIT one (prototype_viterbi_numba.py) -- not a side computation
+    alongside the old pure-numpy path, that path isn't run here at all
+    (its ~100x-slower number is already known from the earlier
+    comparison run; this run is "with numba only", per what was asked).
+    decode() must still raise ValueError on a genuinely undecodable
+    input, same contract the original had (the caller -- Packetizer,
+    ultimately Mac._rx_one_frame() -- catches that and treats the frame
+    as lost, not a crash)."""
     orig_decode = FEC.decode
 
     def patched_decode(self, *args, **kwargs):
         start = time.perf_counter()
-        result = orig_decode(self, *args, **kwargs)
-        timings[f"fec_decode[{self.scheme}]"] += time.perf_counter() - start
-
         if self.scheme == "conv_v27":
             bits = args[0]
-            start = time.perf_counter()
-            _numba_decode(self._impl, bits)
-            timings["fec_decode[conv_v27_numba]"] += time.perf_counter() - start
-
+            result = _numba_decode(self._impl, bits)
+        else:
+            result = orig_decode(self, *args, **kwargs)
+        timings[f"fec_decode[{self.scheme}]"] += time.perf_counter() - start
         return result
 
     FEC.decode = patched_decode
@@ -230,8 +237,7 @@ def run() -> None:
         ("sync+cfo", "sync detect + CFO"),
         ("ofdm_decode", "OFDM decode (FFT+CP strip)"),
         ("chanest_eq", "channel estimation + equalization"),
-        ("fec_decode[conv_v27]", "FEC decode -- Viterbi (fec1, outer)"),
-        ("fec_decode[conv_v27_numba]", "  (same, Numba-JIT prototype)"),
+        ("fec_decode[conv_v27]", "FEC decode -- Viterbi (fec1, outer, Numba-JIT)"),
         ("fec_decode[rs_m8]", "FEC decode -- Reed-Solomon (fec0, inner)"),
         ("mac_decode", "MAC decode"),
     ]:
