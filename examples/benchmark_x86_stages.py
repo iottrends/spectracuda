@@ -30,6 +30,8 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+import sys
 import time
 from collections import defaultdict
 
@@ -37,6 +39,9 @@ import numpy as np
 
 from spectracuda.fec.fec import FEC
 from spectracuda.mac import Mac
+
+sys.path.insert(0, os.path.dirname(__file__))
+from prototype_viterbi_numba import _numba_decode  # noqa: E402 -- proven ~100x faster, see that script
 
 FFT_SIZE = 256
 N_PILOT = 8
@@ -62,13 +67,27 @@ def _install_fec_class_patch(timings: dict):
     instance's decode() call, including the throwaway packetizer's (see
     module docstring), bucketed by that instance's own self.scheme so
     fec0 (rs_m8) and fec1 (conv_v27) are reported separately. Returns a
-    restore function."""
+    restore function.
+
+    For conv_v27 specifically, also runs the Numba-JIT decode
+    (prototype_viterbi_numba.py) on the SAME bits as a timed side
+    computation -- its result is discarded, never substituted for the
+    real decode's output, so this can't change what actually gets
+    delivered. Only there to put both numbers side by side without
+    needing a second script run."""
     orig_decode = FEC.decode
 
     def patched_decode(self, *args, **kwargs):
         start = time.perf_counter()
         result = orig_decode(self, *args, **kwargs)
         timings[f"fec_decode[{self.scheme}]"] += time.perf_counter() - start
+
+        if self.scheme == "conv_v27":
+            bits = args[0]
+            start = time.perf_counter()
+            _numba_decode(self._impl, bits)
+            timings["fec_decode[conv_v27_numba]"] += time.perf_counter() - start
+
         return result
 
     FEC.decode = patched_decode
@@ -212,6 +231,7 @@ def run() -> None:
         ("ofdm_decode", "OFDM decode (FFT+CP strip)"),
         ("chanest_eq", "channel estimation + equalization"),
         ("fec_decode[conv_v27]", "FEC decode -- Viterbi (fec1, outer)"),
+        ("fec_decode[conv_v27_numba]", "  (same, Numba-JIT prototype)"),
         ("fec_decode[rs_m8]", "FEC decode -- Reed-Solomon (fec0, inner)"),
         ("mac_decode", "MAC decode"),
     ]:
