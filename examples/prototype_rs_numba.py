@@ -186,6 +186,44 @@ _STATUS_MESSAGES = {
 }
 
 
+def _numba_decode_full_contract(codeword: np.ndarray) -> np.ndarray:
+    """Same real_k/"shortened RS" handling as ReedSolomonCode.decode()
+    itself (see that method's own docstring) -- NOT just the full-length
+    (real_k == K) case _numba_decode() below covers. Needed to wire into
+    a real pipeline: a PDU whose message length isn't an exact multiple
+    of K=223 symbols produces a shortened leftover block (see fec.py's
+    _decode_symbol_level()), and the simplified _numba_decode() would
+    silently mishandle that (wrong output size, missing the implicit-
+    leading-zero-padding trick) -- caught by checking against a
+    deliberately shortened case before trusting this, not assumed safe
+    by analogy to the full-length one."""
+    host_codeword = np.asarray(codeword, dtype="uint8")
+    if host_codeword.ndim == 1:
+        host_codeword = host_codeword[None, :]
+    real_k = host_codeword.shape[-1] - _NROOTS
+    if not (1 <= real_k <= _K):
+        raise ValueError(
+            f"expected {1 + _NROOTS}..{_N} codeword symbols (real_k + "
+            f"{_NROOTS} for 1 <= real_k <= {_K}), got {host_codeword.shape[-1]}"
+        )
+    n_batch = host_codeword.shape[0]
+    if real_k < _K:
+        pad = np.zeros((n_batch, _K - real_k), dtype="uint8")
+        message_part = host_codeword[:, :real_k]
+        parity_part = host_codeword[:, real_k:]
+        full_codeword = np.concatenate([pad, message_part, parity_part], axis=-1)
+    else:
+        full_codeword = host_codeword
+
+    decoded_full = np.empty((n_batch, _K), dtype="uint8")
+    for b in range(n_batch):
+        result, status = _decode_one_nb(full_codeword[b], _EXP, _LOG)
+        if status != 0:
+            raise ValueError(_STATUS_MESSAGES[status])
+        decoded_full[b] = result
+    return decoded_full[:, _K - real_k:]  # drop the synthetic leading zeros, same as the original
+
+
 def _numba_decode(codeword: np.ndarray) -> np.ndarray:
     """Batch wrapper, same shape contract as ReedSolomonCode.decode()
     for the full-length (real_k == K) case."""

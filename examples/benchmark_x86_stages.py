@@ -45,10 +45,12 @@ from collections import defaultdict
 import numpy as np
 
 from spectracuda.fec.fec import FEC
+from spectracuda.fec.reed_solomon import ReedSolomonCode
 from spectracuda.mac import Mac
 
 sys.path.insert(0, os.path.dirname(__file__))
-from prototype_viterbi_numba import _numba_decode  # noqa: E402 -- proven ~100x faster, see that script
+from prototype_viterbi_numba import _numba_decode as _numba_viterbi_decode  # noqa: E402 -- ~100x, see that script
+from prototype_rs_numba import _numba_decode_full_contract as _numba_rs_decode  # noqa: E402 -- ~10-12x, handles shortened blocks too
 
 FFT_SIZE = 256
 N_PILOT = 8
@@ -76,29 +78,58 @@ def _install_fec_class_patch(timings: dict):
     fec0 (rs_m8) and fec1 (conv_v27) are reported separately. Returns a
     restore function.
 
-    For conv_v27 specifically, the REAL decode path used here IS the
-    Numba-JIT one (prototype_viterbi_numba.py) -- not a side computation
-    alongside the old pure-numpy path, that path isn't run here at all
-    (its ~100x-slower number is already known from the earlier
-    comparison run; this run is "with numba only", per what was asked).
+    For conv_v27, the REAL decode path used here IS the Numba-JIT one
+    (prototype_viterbi_numba.py) -- not a side computation alongside the
+    old pure-numpy path, that path isn't run here at all (its
+    ~100x-slower number is already known from the earlier comparison
+    run; this run is "with numba only", per what was asked).
+
+    For rs_m8, FEC.decode() itself isn't patched to bypass anything --
+    it still calls the real _decode_symbol_level() (which does the real
+    bit/symbol packing and multi-block splitting for a message that
+    isn't an exact multiple of K=223 symbols, see fec.py). Instead
+    ReedSolomonCode.decode() is ALSO patched at the class level, one
+    level deeper, so every block (full-length or the shortened leftover
+    one) goes through the Numba full-contract decode
+    (prototype_rs_numba.py's _numba_decode_full_contract(), verified
+    against exactly this shortened-block case before being trusted
+    here) instead of the original per-codeword algorithm. The existing
+    fec_decode[rs_m8] timing bucket picks up the faster time
+    automatically, since it already times the whole FEC.decode() call
+    that calls down into this.
+
     decode() must still raise ValueError on a genuinely undecodable
     input, same contract the original had (the caller -- Packetizer,
     ultimately Mac._rx_one_frame() -- catches that and treats the frame
-    as lost, not a crash)."""
-    orig_decode = FEC.decode
+    as lost, not a crash) -- both Numba paths do."""
+    orig_fec_decode = FEC.decode
+    orig_rs_decode = ReedSolomonCode.decode
 
-    def patched_decode(self, *args, **kwargs):
+    def patched_fec_decode(self, *args, **kwargs):
         start = time.perf_counter()
         if self.scheme == "conv_v27":
             bits = args[0]
-            result = _numba_decode(self._impl, bits)
+            result = _numba_viterbi_decode(self._impl, bits)
         else:
-            result = orig_decode(self, *args, **kwargs)
+            result = orig_fec_decode(self, *args, **kwargs)
         timings[f"fec_decode[{self.scheme}]"] += time.perf_counter() - start
         return result
 
-    FEC.decode = patched_decode
-    return lambda: setattr(FEC, "decode", orig_decode)
+    def patched_rs_decode(self, codeword, *args, **kwargs):
+        # x86-only, matching the rest of this script -- _numba_rs_decode
+        # always assumes plain numpy input, it does NOT replicate
+        # ReedSolomonCode.decode()'s own cupy.asnumpy() host-conversion
+        # (this whole benchmark only ever runs backend="numpy").
+        return _numba_rs_decode(codeword)
+
+    FEC.decode = patched_fec_decode
+    ReedSolomonCode.decode = patched_rs_decode
+
+    def restore():
+        FEC.decode = orig_fec_decode
+        ReedSolomonCode.decode = orig_rs_decode
+
+    return restore
 
 
 def _instrument(mac: Mac, timings: dict) -> None:
@@ -238,7 +269,7 @@ def run() -> None:
         ("ofdm_decode", "OFDM decode (FFT+CP strip)"),
         ("chanest_eq", "channel estimation + equalization"),
         ("fec_decode[conv_v27]", "FEC decode -- Viterbi (fec1, outer, Numba-JIT)"),
-        ("fec_decode[rs_m8]", "FEC decode -- Reed-Solomon (fec0, inner)"),
+        ("fec_decode[rs_m8]", "FEC decode -- Reed-Solomon (fec0, inner, Numba-JIT)"),
         ("mac_decode", "MAC decode"),
     ]:
         print(f"  {label:>40}: {timings[bucket] / n_calls * 1000:.4f} ms")
