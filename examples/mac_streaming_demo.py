@@ -35,6 +35,19 @@ CHUNK_SIZE = 64  # arbitrary -- rx_streaming() doesn't require any particular
                  # size or alignment; try 37 yourself to see it still works
 
 
+def _to_host(ofdm, arr):
+    """arr may genuinely be a cupy.ndarray (whenever ofdm.backend ==
+    "cupy") -- plain np.asarray() raises on that (CuPy disallows
+    implicit conversion). Same real bug/fix as Mac._rx_one_frame()
+    (spectracuda/mac/mac.py) -- caught on a real Colab Tesla T4 run
+    (2026-08-25)."""
+    if ofdm.backend == "cupy":
+        import cupy
+
+        return cupy.asnumpy(arr)
+    return np.asarray(arr)
+
+
 def _bind(mac_a, mac_b):
     """The real 3-call handshake -- send_iq() has required a successful
     bind() first ever since binding was migrated onto Mac itself (see
@@ -61,7 +74,7 @@ def _stream_deliver(iq_frames, rx_mac, verbose, label):
             n_chunks += 1
             result = rx_mac.ofdm.rx_streaming(chunk)
             if result is not None:
-                decoded_bits = np.asarray(result["bits"])[0].astype("uint8")
+                decoded_bits = _to_host(rx_mac.ofdm, result["bits"])[0].astype("uint8")
                 delivered.extend(rx_mac.receive(decoded_bits))
         if verbose:
             print(f"  {label} frame {frame_idx}: delivered via rx_streaming() "

@@ -47,6 +47,19 @@ from spectracuda.mac.pdu import (
 )
 from spectracuda.mac.quality import decode_quality_report, encode_quality_report
 
+
+def _to_host(ofdm, arr):
+    """arr may genuinely be a cupy.ndarray (whenever ofdm.backend ==
+    "cupy") -- plain np.asarray() raises on that (CuPy disallows
+    implicit conversion). Same real bug/fix as Mac._rx_one_frame()
+    (spectracuda/mac/mac.py) -- caught on a real Colab Tesla T4 run
+    (2026-08-25)."""
+    if ofdm.backend == "cupy":
+        import cupy
+
+        return cupy.asnumpy(arr)
+    return np.asarray(arr)
+
 PHY_KWARGS = dict(
     fft_size=256, n_pilot=8, n_data=216, cp_len=32, modem="qam16",
     fec="rs_m8", fec1="conv_v27",
@@ -98,16 +111,16 @@ def _recv_one_chunk_and_stream_decode(pull_socket, mac):
     if result is None:
         return None
     crc_valid = result["crc_valid"]
-    delivered = crc_valid is None or bool(np.asarray(crc_valid)[0])
+    delivered = crc_valid is None or bool(_to_host(mac.ofdm, crc_valid)[0])
     evm = result["evm"]
     mac.quality.observe(
-        rssi_db=float(np.asarray(result["rssi_db"])[0]),
-        evm=None if evm is None else float(np.asarray(evm)[0]),
+        rssi_db=float(_to_host(mac.ofdm, result["rssi_db"])[0]),
+        evm=None if evm is None else float(_to_host(mac.ofdm, evm)[0]),
         delivered=delivered,
     )
     if not delivered:
         return None
-    return np.asarray(result["bits"])[0].astype("uint8")
+    return _to_host(mac.ofdm, result["bits"])[0].astype("uint8")
 
 
 def _handle_decoded_pdu(label, mac, bits, reply_push_socket, heartbeat, push_lock):

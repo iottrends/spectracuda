@@ -57,6 +57,22 @@ from spectracuda.mac.pdu import (
 )
 from spectracuda.sim import Channel
 
+
+def _to_host(ofdm, arr):
+    """arr may genuinely be a cupy.ndarray (whenever ofdm.backend ==
+    "cupy") -- plain np.asarray() raises on that (CuPy disallows
+    implicit conversion). Same real bug/fix as Mac._rx_one_frame() and
+    MacLink._phy_round() (spectracuda/mac/mac.py, session.py) -- this
+    file reimplements that logic explicitly (see _rx_raw_pdu's
+    docstring) so it needs the identical fix, caught the same way: a
+    real Colab Tesla T4 run (2026-08-25)."""
+    if ofdm.backend == "cupy":
+        import cupy
+
+        return cupy.asnumpy(arr)
+    return np.asarray(arr)
+
+
 _TYPE_NAMES = {
     TYPE_DATA: "DATA", TYPE_STATUS: "STATUS",
     TYPE_BIND_REQUEST: "BIND_REQUEST", TYPE_BIND_RESPONSE: "BIND_RESPONSE",
@@ -137,7 +153,7 @@ def _bind(mac_a, mac_b, label, verbose=True):
     # disturb the real handle_bind_response_iq() call below, which redoes
     # the identical decode for real (and is what actually sets mac_a.bound).
     resp_result = mac_a.ofdm.rx_process(resp_iq)
-    resp_bits = np.asarray(resp_result["bits"])[0].astype("uint8")
+    resp_bits = _to_host(mac_a.ofdm, resp_result["bits"])[0].astype("uint8")
     decision = decode_bind_response(resp_bits)
     if verbose:
         print(f"[{label}] BIND_RESPONSE received {_describe(resp_bits)}  "
@@ -172,21 +188,21 @@ def _rx_raw_pdu(mac, iq, label, verbose=True):
     depending on what's physically arriving on a given Ofdm at a given
     moment -- and to print what actually arrived. Returns None if the
     frame didn't arrive usably."""
-    result = mac.ofdm.rx_process(np.asarray(iq))
+    result = mac.ofdm.rx_process(iq)
     crc_valid = result["crc_valid"]
-    delivered = bool(result["frame_found"]) and (crc_valid is None or bool(np.asarray(crc_valid)[0]))
+    delivered = bool(result["frame_found"]) and (crc_valid is None or bool(_to_host(mac.ofdm, crc_valid)[0]))
     evm = result["evm"]
     mac.quality.observe(
-        rssi_db=float(np.asarray(result["rssi_db"])[0]),
-        evm=None if evm is None else float(np.asarray(evm)[0]),
+        rssi_db=float(_to_host(mac.ofdm, result["rssi_db"])[0]),
+        evm=None if evm is None else float(_to_host(mac.ofdm, evm)[0]),
         delivered=delivered,
     )
     if not delivered:
         if verbose:
             print(f"[{label}] frame NOT delivered (frame_found={bool(result['frame_found'])}, "
-                  f"crc_valid={None if crc_valid is None else bool(np.asarray(crc_valid)[0])})")
+                  f"crc_valid={None if crc_valid is None else bool(_to_host(mac.ofdm, crc_valid)[0])})")
         return None
-    bits = np.asarray(result["bits"])[0].astype("uint8")
+    bits = _to_host(mac.ofdm, result["bits"])[0].astype("uint8")
     if verbose:
         print(f"[{label}] PDU received     {_describe(bits)}")
     return bits
