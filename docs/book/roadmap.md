@@ -1,4 +1,4 @@
-# Coming next: FEC, framing, streaming, and the MAC layer
+# Coming next: framing, streaming, and the MAC layer
 
 These chapters aren't written yet — rather than leave a blank space,
 here's what each will cover and where to read the real material right
@@ -7,13 +7,6 @@ documentation behind it; what's missing is narrative prose in this style,
 not functionality.
 
 ## Part I, continued
-
-**06 — FEC, LDPC & Interleaving.** Convolutional (Viterbi) and
-Reed-Solomon parity matching liquid-dsp exactly; a from-scratch 12-variant
-IEEE 802.11n QC-LDPC family as a deliberate scope expansion *beyond*
-liquid-dsp parity; two-stage concatenated FEC (`fec0`/`fec1`) and why the
-order genuinely matters.
-*See: {doc}`../ldpc`, {doc}`../todo` §1.2/§1.8.*
 
 **07 — Framing & the Header.** The 112-bit liquid-dsp-style frame header,
 the deframer, and how `rx_process()` tells a genuinely-absent frame apart

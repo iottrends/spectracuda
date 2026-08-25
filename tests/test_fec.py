@@ -61,9 +61,43 @@ def test_unknown_scheme_raises():
 
 
 def test_rs_m8_wrong_bit_count_raises():
+    """100 used to be the "wrong length" example -- it no longer is: FEC
+    now supports "shortened" rs_m8 (N full 1784-bit blocks + at most one
+    leftover block of ANY byte-aligned size, see fec.py's encoded_length()
+    docstring) -- the genuinely invalid case moved to a NON-byte-aligned
+    leftover (100 % 8 != 0), which decode() could never unambiguously
+    reverse (np.packbits would otherwise silently zero-pad it -- a real
+    bug caught while building this, see the encode()/decode() comments)."""
     fec = FEC("rs_m8", backend="numpy")
     with pytest.raises(ValueError):
-        fec.encode(np.zeros((1, 100), dtype="uint8"))
+        fec.encode(np.zeros((1, 100), dtype="uint8"))  # 100 % 8 != 0
+    # a genuinely byte-aligned, non-block-multiple size is fine now:
+    fec.encode(np.zeros((1, 96), dtype="uint8"))  # no raise
+
+
+def test_rs_m8_shortened_leftover_block_round_trips():
+    """A real message that isn't an exact multiple of 1784 bits (the
+    actual, common case -- e.g. a 13-byte bind request is 104 bits after
+    CRC) now round-trips, encoded as ONLY the real bytes + parity, not
+    padded up to a full 1784-bit block -- see fec.py's encoded_length()
+    docstring for why."""
+    fec = FEC("rs_m8", backend="numpy")
+    bits = np.random.default_rng(0).integers(0, 2, size=(1, 104)).astype("uint8")
+    encoded = fec.encode(bits)
+    assert encoded.shape[-1] == 104 + 8 * 32  # real bits + parity, NOT padded to 2040
+    np.testing.assert_array_equal(fec.decode(encoded), bits)
+
+
+def test_rs_m8_multi_block_plus_leftover_round_trips():
+    """N full blocks + one shortened leftover block together -- the
+    general case a big, multi-segment message actually needs, not just
+    the small-message case above."""
+    fec = FEC("rs_m8", backend="numpy")
+    n_bits = 1784 * 2 + 800  # 2 full blocks + an 800-bit leftover
+    bits = np.random.default_rng(1).integers(0, 2, size=(1, n_bits)).astype("uint8")
+    encoded = fec.encode(bits)
+    assert encoded.shape[-1] == fec.encoded_length(n_bits)
+    np.testing.assert_array_equal(fec.decode(encoded), bits)
 
 
 def test_process_is_alias_for_encode():

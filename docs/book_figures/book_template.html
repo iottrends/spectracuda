@@ -1,0 +1,1090 @@
+<title>The OFDM Field Guide</title>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Titillium+Web:wght@400;600;700;900&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+  :root {
+    --bg: #F5F7FA;
+    --surface: #FFFFFF;
+    --surface-2: #EDF1F6;
+    --border: #DCE3EC;
+    --text: #131A26;
+    --text-muted: #5B6B84;
+    --accent: #0E8C82;
+    --accent-ink: #FFFFFF;
+    --accent-2: #B5690A;
+    --code-bg: #F0F3F8;
+    --code-border: #D3DCE8;
+    --shadow: 0 1px 2px rgba(20, 30, 50, 0.06), 0 8px 24px rgba(20, 30, 50, 0.05);
+    --figure-bg: #0F1826;
+
+    --font-display: "Titillium Web", "Segoe UI", system-ui, sans-serif;
+    --font-body: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0B1220;
+      --surface: #121B2E;
+      --surface-2: #0E1626;
+      --border: #223049;
+      --text: #E7ECF3;
+      --text-muted: #93A4BC;
+      --accent: #3FDCCF;
+      --accent-ink: #06201D;
+      --accent-2: #F2A94E;
+      --code-bg: #0F1826;
+      --code-border: #1E2C44;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0B1220;
+    --surface: #121B2E;
+    --surface-2: #0E1626;
+    --border: #223049;
+    --text: #E7ECF3;
+    --text-muted: #93A4BC;
+    --accent: #3FDCCF;
+    --accent-ink: #06201D;
+    --accent-2: #F2A94E;
+    --code-bg: #0F1826;
+    --code-border: #1E2C44;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px rgba(0, 0, 0, 0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    text-wrap: balance;
+    color: var(--text);
+  }
+
+  code, pre, .mono { font-family: var(--font-mono); }
+
+  /* ---------- shell layout ---------- */
+  .shell {
+    display: grid;
+    grid-template-columns: 272px minmax(0, 1fr);
+    min-height: 100vh;
+    max-width: 1320px;
+    margin: 0 auto;
+  }
+
+  .sidebar {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    height: 100vh;
+    overflow-y: auto;
+    padding: 28px 22px 40px;
+    border-right: 1px solid var(--border);
+    background: var(--surface-2);
+  }
+
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .brand-mark {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    color: var(--accent);
+    font-size: 13px;
+    letter-spacing: 0.06em;
+  }
+  .brand-name {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 17px;
+  }
+  .sidebar .subtitle {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+    margin: 2px 0 26px;
+  }
+
+  .theme-toggle {
+    display: inline-flex;
+    gap: 4px;
+    margin-bottom: 24px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 3px;
+    background: var(--surface);
+  }
+  .theme-toggle button {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 5px 10px;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .theme-toggle button.active {
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+
+  .navpart {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin: 22px 0 8px;
+  }
+  .navpart:first-of-type { margin-top: 0; }
+
+  .navlist { list-style: none; padding: 0; margin: 0; }
+  .navlist li { margin: 1px 0; }
+  .navlist a {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    color: var(--text);
+    text-decoration: none;
+    font-size: 13.5px;
+    line-height: 1.35;
+  }
+  .navlist a:hover { background: var(--surface); }
+  .navlist a.current { background: var(--surface); box-shadow: inset 2px 0 0 var(--accent); font-weight: 600; }
+  .navlist .num { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); flex-shrink: 0; width: 1.4em; }
+  .navlist .soon-tag {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    flex-shrink: 0;
+  }
+  .navlist a.stub { color: var(--text-muted); }
+
+  /* ---------- main column ---------- */
+  main { padding: 40px clamp(20px, 4vw, 64px) 90px; min-width: 0; }
+
+  .titlepanel {
+    position: relative;
+    padding: 36px 34px 30px;
+    margin-bottom: 46px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: linear-gradient(165deg, var(--surface) 0%, var(--surface-2) 100%);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .titlepanel svg.trace { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0.35; }
+  .titlepanel .eyebrow {
+    position: relative;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .titlepanel h1 {
+    position: relative;
+    font-size: clamp(28px, 4vw, 40px);
+    line-height: 1.08;
+    margin: 0 0 12px;
+  }
+  .titlepanel p {
+    position: relative;
+    font-family: var(--font-body);
+    font-size: 16.5px;
+    color: var(--text-muted);
+    max-width: 62ch;
+    margin: 0;
+  }
+
+  .prose { max-width: 68ch; }
+  .prose p { margin: 0 0 1.1em; }
+  .prose ul, .prose ol { margin: 0 0 1.1em; padding-left: 1.4em; }
+  .prose li { margin-bottom: 0.4em; }
+  .prose strong { font-weight: 600; }
+  .prose em { font-style: italic; }
+
+  section.chapter { margin-bottom: 72px; scroll-margin-top: 24px; }
+  section.chapter .chapnum {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--accent);
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+  }
+  section.chapter h2 { font-size: clamp(22px, 3vw, 29px); margin: 0 0 20px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+  section.chapter h3 { font-size: 18px; margin: 30px 0 12px; }
+  .prose h3 { max-width: 68ch; }
+
+  .lede {
+    font-size: 19px;
+    line-height: 1.55;
+    color: var(--text);
+    max-width: 66ch;
+    margin-bottom: 1.3em;
+  }
+
+  /* code blocks */
+  .codewrap { max-width: 74ch; margin: 0 0 1.4em; }
+  pre.code {
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 13.3px;
+    line-height: 1.6;
+    margin: 0;
+  }
+  pre.code code { color: var(--text); white-space: pre; }
+  .tok-c { color: var(--text-muted); font-style: italic; }
+  .tok-s { color: var(--accent-2); }
+  .tok-k { color: var(--accent); font-weight: 600; }
+  .code-label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  /* figures — presented as fixed instrument captures, own styling regardless of page theme */
+  figure.scope {
+    max-width: 100%;
+    margin: 1.6em 0 1.8em;
+    border: 1px solid var(--code-border);
+    border-radius: 12px;
+    background: var(--figure-bg);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  figure.scope .scope-bar {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 9px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    color: #7C8DA6;
+  }
+  figure.scope .scope-bar .dot { width: 7px; height: 7px; border-radius: 50%; background: #35D0C4; opacity: 0.55; }
+  figure.scope .scope-frame { overflow-x: auto; }
+  figure.scope img { display: block; width: 100%; height: auto; }
+  figure.scope figcaption {
+    padding: 12px 16px 14px;
+    font-family: var(--font-body);
+    font-size: 13.5px;
+    color: #A9B7CC;
+    border-top: 1px solid rgba(255,255,255,0.08);
+  }
+  figure.scope figcaption b { color: #E7ECF3; }
+
+  .callout {
+    max-width: 68ch;
+    margin: 0 0 1.4em;
+    padding: 14px 18px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    font-size: 15px;
+  }
+  .callout .label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+    margin-bottom: 5px;
+    display: block;
+  }
+  .callout.verify { border-left: 3px solid var(--accent); }
+  .callout.caveat { border-left: 3px solid var(--accent-2); }
+
+  table.spec {
+    width: 100%;
+    max-width: 74ch;
+    border-collapse: collapse;
+    margin: 0 0 1.6em;
+    font-size: 14px;
+  }
+  table.spec th, table.spec td {
+    text-align: left;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  table.spec th {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    font-weight: 600;
+  }
+  table.spec td.mono { font-family: var(--font-mono); font-size: 13px; }
+  .tablewrap { overflow-x: auto; }
+
+  .diagram {
+    max-width: 74ch;
+    margin: 0 0 1.6em;
+    padding: 22px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    overflow-x: auto;
+  }
+  .diagram-row { display: flex; align-items: center; gap: 0; font-family: var(--font-mono); font-size: 12.5px; flex-wrap: nowrap; min-width: max-content;}
+  .diagram-box {
+    padding: 10px 13px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-2);
+    text-align: center;
+    white-space: nowrap;
+  }
+  .diagram-box.accent { border-color: var(--accent); color: var(--accent); }
+  .diagram-arrow { padding: 0 8px; color: var(--text-muted); }
+  .diagram-caption { font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); text-align: center; margin-top: 6px; letter-spacing: 0.03em;}
+
+  .nextup {
+    display: grid;
+    gap: 12px;
+    max-width: 74ch;
+  }
+  .nextup-item {
+    padding: 16px 18px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+  }
+  .nextup-item h4 { margin: 0 0 6px; font-size: 15.5px; }
+  .nextup-item p { margin: 0 0 8px; font-size: 14.5px; color: var(--text-muted); }
+  .nextup-item .refs { font-family: var(--font-mono); font-size: 12px; }
+  .nextup-item .refs a { margin-right: 12px; }
+
+  footer.book-footer {
+    max-width: 74ch;
+    margin-top: 60px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    font-size: 13.5px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+  }
+  footer.book-footer a { color: var(--text-muted); }
+
+  @media (max-width: 880px) {
+    .shell { grid-template-columns: 1fr; }
+    .sidebar { position: relative; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { scroll-behavior: auto !important; }
+  }
+
+  html { scroll-behavior: smooth; }
+</style>
+
+<div class="shell">
+  <nav class="sidebar" aria-label="Book chapters">
+    <div class="brand">
+      <span class="brand-mark">// spectracuda</span>
+    </div>
+    <div class="brand-name">The OFDM Field Guide</div>
+    <div class="subtitle">a working tour of a real PHY+MAC stack</div>
+
+    <div class="theme-toggle" role="group" aria-label="Theme">
+      <button type="button" data-theme-choice="system" class="active">System</button>
+      <button type="button" data-theme-choice="light">Light</button>
+      <button type="button" data-theme-choice="dark">Dark</button>
+    </div>
+
+    <div class="navpart">Start here</div>
+    <ul class="navlist">
+      <li><a href="#preface"><span class="num">§</span>Preface</a></li>
+    </ul>
+
+    <div class="navpart">Part I — the OFDM PHY chain</div>
+    <ul class="navlist">
+      <li><a href="#ch1"><span class="num">01</span>The Ofdm Object</a></li>
+      <li><a href="#ch2"><span class="num">02</span>Synchronization</a></li>
+      <li><a href="#ch3"><span class="num">03</span>Carrier Frequency Offset</a></li>
+      <li><a href="#ch4"><span class="num">04</span>Channel Estimation &amp; Equalization</a></li>
+      <li><a href="#ch5"><span class="num">05</span>The Modem</a></li>
+      <li><a href="#ch6"><span class="num">06</span>FEC, LDPC &amp; Interleaving</a></li>
+      <li><a href="#coming-phy" class="stub"><span class="num">07</span>Framing &amp; the Header<span class="soon-tag">soon</span></a></li>
+      <li><a href="#coming-phy" class="stub"><span class="num">08</span>Streaming Receive<span class="soon-tag">soon</span></a></li>
+    </ul>
+
+    <div class="navpart">Part II — the MAC layer</div>
+    <ul class="navlist">
+      <li><a href="#coming-mac" class="stub"><span class="num">09</span>TM / UM / AM<span class="soon-tag">soon</span></a></li>
+      <li><a href="#coming-mac" class="stub"><span class="num">10</span>Two Independent Radios<span class="soon-tag">soon</span></a></li>
+      <li><a href="#coming-mac" class="stub"><span class="num">11</span>Binding &amp; Link Quality<span class="soon-tag">soon</span></a></li>
+      <li><a href="#coming-mac" class="stub"><span class="num">12</span>Bidirectional AM<span class="soon-tag">soon</span></a></li>
+    </ul>
+
+    <div class="navpart">Reference</div>
+    <ul class="navlist">
+      <li><a href="#colophon"><span class="num">§</span>About this book</a></li>
+    </ul>
+  </nav>
+
+  <main>
+    <div class="titlepanel">
+      <svg class="trace" viewBox="0 0 900 140" preserveAspectRatio="none" aria-hidden="true">
+        <polyline points="0,90 30,90 40,40 55,130 70,90 90,90 120,90 128,20 136,150 144,90 160,90 200,90 900,90"
+          fill="none" stroke="#3FDCCF" stroke-width="1.4" opacity="0.7" />
+        <polyline points="0,110 60,110 60,60 130,60 130,150 210,150 210,70 900,70"
+          fill="none" stroke="#F2A94E" stroke-width="1" opacity="0.4" stroke-dasharray="2 4"/>
+      </svg>
+      <div class="eyebrow">spectracuda — a GPU-accelerated, liquid-dsp-inspired SDR stack</div>
+      <h1>The OFDM Field Guide</h1>
+      <p>How this codebase's OFDM PHY chain and MAC layer actually work, chapter by chapter —
+      grounded in the real classes, run against real signals, with every figure generated
+      by the code sitting right next to it, not a hand-drawn stand-in.</p>
+    </div>
+
+    <section class="chapter prose" id="preface">
+      <h2>Preface</h2>
+      <p class="lede">This book assumes you already know what an IQ sample is, roughly what
+      an FFT does, and why OFDM splits a wideband channel into narrowband subcarriers.
+      If any of that is new, <a href="https://pysdr.org" target="_blank" rel="noopener">PySDR</a>
+      covers that ground properly and this book won't try to repeat it. What follows
+      instead is the part PySDR can't cover: how <strong>this specific codebase</strong>
+      — a real, tested, GPU-batched implementation — solves timing sync, carrier
+      offset, channel estimation, equalization, modulation, forward error correction,
+      framing, and a MAC layer on top of all of it.</p>
+
+      <p>Every plot in this book was produced by
+      <code>docs/book_figures/generate_figures.py</code>, which imports spectracuda's
+      actual classes and runs them — nothing here is illustrative pseudo-code standing
+      in for behavior the library doesn't really have. Where a figure needed an
+      internal value a class doesn't normally hand back (the full Schmidl-Cox metric
+      curve, the equalized payload symbols before hard-decision), the script says so in
+      a comment and checks the result against the class's own reported numbers before
+      trusting it for display. You can regenerate every figure yourself:</p>
+
+      <div class="codewrap"><div class="code-label">shell</div><pre class="code"><code><span class="tok-c"># matplotlib is dev-only -- never a runtime dependency of spectracuda itself</span>
+pip install -e <span class="tok-s">".[docs]"</span>
+python docs/book_figures/generate_figures.py</code></pre></div>
+
+      <p>This is a living document, and it says so honestly where it's incomplete —
+      Part II's chapters are stubs today, pointing at the real design docs instead of
+      pretending to be finished prose. Nothing in this book substitutes for
+      <code>docs/architecture.md</code>, <code>docs/mac.md</code>, or
+      <code>docs/todo.md</code> — those are the actual source of truth, including every
+      real bug found and fixed along the way. This book is the guided tour; those
+      documents are the map.</p>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="chapter prose" id="ch1">
+      <div class="chapnum">Chapter 01 — Part I</div>
+      <h2>The <code>Ofdm</code> Object</h2>
+
+      <p class="lede">Everywhere liquid-dsp splits transmit and receive into separate
+      objects (<code>ofdmflexframegen</code> / <code>ofdmflexframesync</code>), spectracuda
+      collapses both directions into one class: <code>Ofdm</code>. That's not a
+      simplification for its own sake — tx and rx share almost every parameter
+      (subcarrier allocation, CP length, preamble content, training symbols), and
+      keeping them separate means hand-matching those values across two objects every
+      time you change one. One object removes an entire class of bug: tx and rx
+      silently drifting out of sync on preamble or training content.</p>
+
+      <div class="codewrap"><div class="code-label">python</div><pre class="code"><code><span class="tok-k">from</span> spectracuda.pipeline <span class="tok-k">import</span> Ofdm
+<span class="tok-k">import</span> numpy <span class="tok-k">as</span> np
+
+ofdm = Ofdm(
+    fft_size=<span class="tok-s">256</span>, n_pilot=<span class="tok-s">8</span>, n_data=<span class="tok-s">216</span>, cp_len=<span class="tok-s">32</span>,
+    modem=<span class="tok-s">"qpsk"</span>, fec=<span class="tok-s">"conv_v27"</span>, crc=<span class="tok-s">"crc32"</span>,
+    sync=<span class="tok-s">"schmidl_cox"</span>, cfo=<span class="tok-s">"schmidl_cox"</span>,
+    channel_estimator=<span class="tok-s">"ls"</span>, equalizer=<span class="tok-s">"mmse"</span>,
+)
+
+bits = np.random.default_rng(<span class="tok-s">0</span>).integers(<span class="tok-s">0</span>, <span class="tok-s">2</span>, size=(<span class="tok-s">1</span>, <span class="tok-s">64</span>)).astype(<span class="tok-s">"uint8"</span>)
+tx_iq = ofdm.generate_frame(bits)      <span class="tok-c"># -> (1, n_samples) complex64</span>
+result = ofdm.rx_process(tx_iq)        <span class="tok-c"># -> dict, stable key set</span>
+
+result[<span class="tok-s">"frame_found"</span>]   <span class="tok-c"># True</span>
+result[<span class="tok-s">"bits"</span>]           <span class="tok-c"># decoded payload bits</span>
+result[<span class="tok-s">"crc_valid"</span>]      <span class="tok-c"># per-item bool array</span>
+result[<span class="tok-s">"evm"</span>], result[<span class="tok-s">"rssi_db"</span>], result[<span class="tok-s">"cfo_estimate"</span>], result[<span class="tok-s">"header"</span>]</code></pre></div>
+
+      <p>A receiver is never told what the transmitter chose for
+      <code>modem=</code>/<code>fec=</code>/<code>crc=</code> — <code>Ofdm</code> packs all of
+      that into a 112-bit frame header (a liquid-dsp-style convention) and resolves it
+      dynamically from the decoded frame, exactly the way a real, physically separate
+      receiving device has to. That's what makes the two-radio examples in Part II
+      meaningful rather than a simulation shortcut: each side's <code>Ofdm</code> is
+      built independently and never inspects the other's configuration.</p>
+
+      <h3>The tx→channel→rx chain, at a glance</h3>
+      <div class="diagram">
+        <div class="diagram-row">
+          <div class="diagram-box">payload bits</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">FEC + CRC</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">interleave</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">Modem</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">resource grid</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">IFFT + CP</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box accent">preamble + training</div>
+        </div>
+        <div class="diagram-caption">generate_frame() — tx, left to right</div>
+      </div>
+      <div class="diagram">
+        <div class="diagram-row">
+          <div class="diagram-box accent">sync</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">CFO correct</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">FFT + CP strip</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">channel est.</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">equalize</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">demod</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">deinterleave</div><div class="diagram-arrow">→</div>
+          <div class="diagram-box">FEC decode + CRC</div>
+        </div>
+        <div class="diagram-caption">rx_process() — rx, left to right</div>
+      </div>
+
+      <p>Every stage after "payload bits" and before "demod"/"CRC" is <strong>batch-shaped</strong>:
+      every block operates on <code>(n_batch, …)</code> arrays, never a single scalar
+      sample. That's a deliberate departure from liquid-dsp's own
+      <code>execute(samples, n)</code> streaming idiom — GPU throughput on a Jetson-class
+      part only pays off once work is batched, so spectracuda batches by design and
+      offers a separate, additive streaming receiver (<code>rx_streaming()</code>,
+      Chapter 08) for the arbitrary-chunk case liquid-dsp's idiom targets.</p>
+
+      <p>The whole compute path runs in <code>complex64</code>/<code>float32</code>, never
+      <code>float64</code> — Jetson-class GPUs have drastically lower double-precision
+      throughput, so a silent upcast (numpy's own <code>fft</code>/<code>ifft</code> always
+      computes in double precision internally, regardless of input dtype — a real bug
+      found and fixed during development) is a hidden performance cliff on the actual
+      target hardware, not a style nit.</p>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="chapter prose" id="ch2">
+      <div class="chapnum">Chapter 02 — Part I</div>
+      <h2>Synchronization</h2>
+
+      <p class="lede">Before anything else can happen, a receiver has to answer one
+      question: <em>where, in this stream of samples, does the frame actually start?</em>
+      Everything downstream — CFO correction, channel estimation, demodulation —
+      assumes that question is already answered. Get it wrong by even a handful of
+      samples and every subcarrier's phase is wrong too.</p>
+
+      <p>spectracuda offers two independent <code>sync=</code> strategies, chosen by
+      string like every other swappable stage:</p>
+
+      <div class="tablewrap"><table class="spec">
+        <thead><tr><th>Strategy</th><th>Idea</th><th>liquid-dsp precedent</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">"zc"</td><td>Cross-correlate against a known Zadoff-Chu sequence — you know exactly what you're looking for.</td><td><code>qdetector_create_linear</code></td></tr>
+          <tr><td class="mono">"schmidl_cox"</td><td>Self-correlate a preamble made of two identical halves — you don't need to know the sequence, only that it repeats.</td><td>extracted from <code>ofdmframesync.c</code>'s S0/S1 handling — not exposed as its own reusable block</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>How Schmidl-Cox actually decides</h3>
+      <p>The 1997 Schmidl &amp; Cox algorithm builds a preamble whose first and second
+      halves are identical in the time domain (achieved by putting energy only on
+      even subcarriers before the IFFT). A receiver then slides a window across the
+      incoming stream and, at every candidate offset <code>d</code>, asks "how well does
+      the first half of this window correlate with the second half?" The metric:</p>
+
+      <div class="codewrap"><div class="code-label">the metric, in code (spectracuda/sync/schmidl_cox.py)</div><pre class="code"><code>P(d) = sum_{m=0}^{L-1} conj(r[d+m]) * r[d+m+L]
+R(d) = 0.5 * ( sum |r[d+m]|^2 + sum |r[d+m+L]|^2 )
+M(d) = |P(d)|^2 / R(d)^2</code></pre></div>
+
+      <div class="callout caveat"><span class="label">a real deviation from the textbook formula</span>
+      The original 1997 paper normalizes by second-half energy only. That denominator
+      collapses toward zero whenever a candidate window straddles the boundary between
+      the preamble and a low-energy region right after it — confirmed empirically
+      during development, where such a boundary produced a metric of ~77 against a
+      true peak bounded at 1.0. This implementation uses the symmetric energy shown
+      above (both halves), which needs <em>both</em> windows to be low-energy for the
+      denominator to vanish, and is exact in the noiseless case just like the original.</div>
+
+      <p>Run against a synthetic stream — 400 samples of noise, then a real preamble,
+      then more noise — the metric traces a sharp, unambiguous peak exactly where the
+      preamble begins:</p>
+
+      <figure class="scope">
+        <div class="scope-bar"><span class="dot"></span>SCHMIDL-COX · TIMING METRIC · fft_size=256</div>
+        <div class="scope-frame"><img src="__IMG_SYNC_METRIC__" alt="Schmidl-Cox timing metric plotted against candidate sample offset, showing a sharp peak of 1.000 at the true preamble start, with low, noisy metric values everywhere else in the stream."></div>
+        <figcaption>Real output of <code>SchmidlCoxSync.process()</code> on a 256-sample preamble buried
+        in noise. The dashed line is where the block actually reports <code>start_index</code>;
+        it lands exactly on the dotted true-start line. (The full curve isn't something
+        <code>process()</code> returns directly — it only returns the peak — so this script
+        mirrors the exact formula above to plot every candidate, then asserts its own
+        argmax matches the real block's <code>start_index</code> before trusting the plot.)</figcaption>
+      </figure>
+
+      <div class="callout"><span class="label">a real, GPU-shaped design choice</span>
+      Candidate offsets aren't evaluated with a Python loop sliding one sample at a
+      time. <code>P(d)</code>/<code>R(d)</code> are computed for <em>every</em> candidate at once via
+      prefix-sum cumulative arrays — the same "many candidates evaluated as one batched
+      array op" reframing this whole codebase applies wherever liquid-dsp's own
+      C idiom would reach for a sequential loop.</div>
+
+      <h3>Not every <code>sync</code>/<code>cfo</code> pairing is valid</h3>
+      <p><code>SchmidlCoxCFO</code> (Chapter 03) depends on the preamble's repeated-halves
+      structure and only pairs with <code>sync="schmidl_cox"</code>. <code>PilotBasedCFO</code> has
+      no such dependency and works with either <code>sync=</code> value.
+      <code>sync="zc"</code> + <code>cfo="schmidl_cox"</code> reliably fails — use
+      <code>cfo="pilot_based"</code> with a Zadoff-Chu preamble instead.</p>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="chapter prose" id="ch3">
+      <div class="chapnum">Chapter 03 — Part I</div>
+      <h2>Carrier Frequency Offset</h2>
+
+      <p class="lede">A transmitter's local oscillator and a receiver's local
+      oscillator are never running at exactly the same frequency — even a few parts
+      per million of mismatch, at gigahertz carrier frequencies, becomes a real offset
+      of tens to thousands of hertz. Left uncorrected, that offset shows up as a
+      steadily rotating phasor multiplying every received sample.</p>
+
+      <div class="codewrap"><div class="code-label">the physical model (spectracuda/sim/channel.py)</div><pre class="code"><code>r[n] = s[n] * exp( j * 2*pi * cfo * n / fft_size )</code></pre></div>
+
+      <p><code>cfo</code> here is expressed in units of subcarrier spacing — a <code>cfo</code>
+      of 1.0 means the offset equals exactly one subcarrier's width. Applied to a
+      stream of QPSK symbols with no correction, that steady phase ramp smears every
+      symbol around a full circle:</p>
+
+      <figure class="scope">
+        <div class="scope-bar"><span class="dot"></span>QPSK · CFO = 3.5 SUBCARRIERS · UNCORRECTED VS. CORRECTED</div>
+        <div class="scope-frame"><img src="__IMG_CFO_ROTATION__" alt="Two constellation scatter plots side by side. The left plot, uncorrected, shows QPSK symbols smeared into a full circle by carrier frequency offset. The right plot, corrected, shows the same symbols collapsed back into four tight clusters at the QPSK constellation points."></div>
+        <figcaption>Real <code>Modem("qpsk")</code> symbols, with the exact phase ramp above
+        applied and then exactly removed (a known offset — no estimator involved in this
+        panel). This is the effect a CFO estimator exists to undo automatically, without
+        knowing the offset in advance.</figcaption>
+      </figure>
+
+      <p>spectracuda offers two <code>cfo=</code> strategies:</p>
+
+      <div class="tablewrap"><table class="spec">
+        <thead><tr><th>Strategy</th><th>How it estimates</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">"schmidl_cox"</td><td>Reuses the sync preamble's own repeated-halves phase difference — cheap, but only valid alongside <code>sync="schmidl_cox"</code>.</td></tr>
+          <tr><td class="mono">"pilot_based"</td><td>Tracks phase drift across pilot subcarriers symbol-to-symbol — independent of which <code>sync=</code> found the frame, works with either.</td></tr>
+        </tbody>
+      </table></div>
+
+      <p>Run through the real pipeline — <code>Ofdm(cfo="schmidl_cox")</code>, a
+      <code>Channel</code> with a known offset applied, a full <code>generate_frame()</code> →
+      <code>rx_process()</code> round trip — the estimator recovers the offset and the
+      equalizer's output collapses back to tight clusters:</p>
+
+      <figure class="scope">
+        <div class="scope-bar"><span class="dot"></span>REAL RX_PROCESS() · cfo=0.900 · snr=25dB</div>
+        <div class="scope-frame"><img src="__IMG_CFO_RECOVERED__" alt="A tight, four-cluster QPSK constellation plot showing the real decoded payload symbols after SchmidlCoxCFO correction, with estimated CFO of 0.898 against a true CFO of 0.900."></div>
+        <figcaption>The actual equalized payload symbols from one real <code>rx_process()</code>
+        call — captured by temporarily wrapping the equalizer's own output during a real
+        decode, then double-checked by recomputing EVM from those captured symbols and
+        confirming it matches the value <code>rx_process()</code> itself reported (0.1049 both
+        ways) before trusting the plot.</figcaption>
+      </figure>
+
+      <div class="callout caveat"><span class="label">an honest, measured limit — not a spec number</span>
+      The illustration above uses <code>cfo=3.5</code> because it's a directly-applied,
+      exactly-known offset — no estimator involved, so any magnitude makes the point.
+      The <em>real</em> <code>SchmidlCoxCFO</code> estimator has a narrower reliable range:
+      sweeping true offsets from 0.1 to 3.5 subcarriers at 25 dB SNR, this
+      implementation decodes correctly through roughly 1.0 subcarrier of offset and
+      fails past about 1.5 — which is why the second figure above uses 0.9, not 3.5.
+      That sweep lives in <code>generate_figures.py</code>'s own commit history, not
+      asserted from memory.</div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="chapter prose" id="ch4">
+      <div class="chapnum">Chapter 04 — Part I</div>
+      <h2>Channel Estimation &amp; Equalization</h2>
+
+      <p class="lede">Multipath doesn't distort a signal uniformly — each subcarrier
+      sees a different complex gain, because each corresponds to a different
+      frequency and the channel's frequency response varies across the band. A single
+      global correction can't fix that; equalization has to happen <em>per subcarrier</em>,
+      which means the receiver first needs to know what each subcarrier's gain
+      actually is.</p>
+
+      <p>That's what pilot subcarriers are for: known symbols, scattered across the
+      resource grid at fixed positions, that the receiver can compare against what it
+      actually received to back out the channel's effect at those positions.</p>
+
+      <div class="tablewrap"><table class="spec">
+        <thead><tr><th>Stage</th><th>Strategies</th><th>The tradeoff each represents</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">channel_estimator=</td><td>"ls", "mmse"</td><td>LS solves the pilot equations directly (no assumptions, more noise-sensitive); MMSE folds in a noise-aware prior (biased toward smoother estimates, less noise-sensitive).</td></tr>
+          <tr><td class="mono">equalizer=</td><td>"zf", "mmse"</td><td>Zero-forcing inverts the channel exactly (can blow up where the channel is weak); MMSE balances inversion against noise amplification.</td></tr>
+        </tbody>
+      </table></div>
+
+      <p>Neither pairing has a liquid-dsp precedent to match against — liquid-dsp's own
+      <code>eqlms</code>/<code>eqrls</code> are sample-adaptive single-carrier equalizers, not
+      per-subcarrier frequency-domain ZF/MMSE — so both are designed here from standard
+      OFDM receiver references rather than ported from existing source.</p>
+
+      <p>Run against a real, randomly-generated 4-tap multipath channel, an
+      <code>Ofdm(channel_estimator="ls", equalizer="mmse")</code> receiver recovers a
+      channel-magnitude estimate that tracks the true frequency response closely
+      across every data subcarrier, and the equalized constellation comes back tight:</p>
+
+      <figure class="scope">
+        <div class="scope-bar"><span class="dot"></span>4-TAP MULTIPATH · LS ESTIMATE + MMSE EQUALIZER · snr=26dB</div>
+        <div class="scope-frame"><img src="__IMG_CHANNEL_EQ__" alt="Left panel: a line plot comparing the true multipath channel frequency response magnitude against the LS channel estimate magnitude across 216 data subcarriers, the two curves nearly overlapping. Right panel: a tight four-cluster QPSK constellation after MMSE equalization, EVM 0.0856."></div>
+        <figcaption><b>Left:</b> <code>result["channel_estimate"]</code> (the real LS estimate a
+        <code>rx_process()</code> call returns) plotted against the true channel's FFT,
+        evaluated at the exact data-subcarrier bins <code>ofdm.grid.data_indices</code>
+        reports. <b>Right:</b> the real equalized payload symbols from that same decode —
+        same capture-and-verify technique as Chapter 03's recovered-constellation figure.</figcaption>
+      </figure>
+
+      <div class="callout"><span class="label">a real edge case, found while building this figure</span>
+      A long payload through a real multipath channel can shift the detected frame
+      start a few samples later than the noiseless case (delay spread), and
+      <code>generate_frame()</code>'s output carries no built-in trailing margin beyond
+      exactly what a nominal-start decode needs — so a late-detected start can run the
+      last payload symbol past the end of the buffer. The figure script works around
+      it by padding trailing silence, exactly as any real captured buffer would have
+      some idle samples after a frame anyway; the underlying question of how much
+      margin a real streaming capture should keep is still open territory (see
+      <code>docs/todo.md</code> #1.11's neighborhood) rather than something quietly
+      papered over here.</div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="chapter prose" id="ch5">
+      <div class="chapnum">Chapter 05 — Part I</div>
+      <h2>The Modem</h2>
+
+      <p class="lede">One class, a scheme-name string — <code>Modem(scheme)</code> mirrors
+      liquid-dsp's own <code>modem_create(scheme)</code> about as directly as this codebase
+      mirrors anything. Five Gray-coded PSK/QAM constellations, each normalized to
+      unit average power using the same constants IEEE 802.11 itself uses
+      (1/√2, 1/√10, 1/√42, 1/√170):</p>
+
+      <div class="codewrap"><div class="code-label">python</div><pre class="code"><code><span class="tok-k">from</span> spectracuda.modem.mapper <span class="tok-k">import</span> Modem
+
+modem = Modem(<span class="tok-s">"qam16"</span>)
+bits = np.random.default_rng(<span class="tok-s">0</span>).integers(<span class="tok-s">0</span>, <span class="tok-s">2</span>, size=(<span class="tok-s">1</span>, <span class="tok-s">4</span> * <span class="tok-s">200</span>)).astype(<span class="tok-s">"uint8"</span>)
+symbols = modem.modulate(bits)       <span class="tok-c"># (1, 200) complex64</span>
+recovered = modem.demodulate(symbols) <span class="tok-c"># hard-decision, nearest point</span></code></pre></div>
+
+      <p>Every point of every supported scheme, generated by actually modulating all
+      <code>2**bits_per_symbol</code> possible bit patterns through the real class:</p>
+
+      <figure class="scope">
+        <div class="scope-bar"><span class="dot"></span>MODEM GALLERY · ALL 5 SCHEMES · UNIT AVERAGE POWER</div>
+        <div class="scope-frame"><img src="__IMG_CONSTELLATION__" alt="Five constellation diagrams side by side, for BPSK (2 points), QPSK (4 points), 16-QAM (16 points), 64-QAM (64 points), and 256-QAM (256 points), each generated by exhaustively modulating every possible bit pattern through spectracuda's real Modem class."></div>
+        <figcaption>Every point is real output of <code>Modem(scheme).modulate()</code> — not a
+        textbook constellation reference image.</figcaption>
+      </figure>
+
+      <div class="callout caveat"><span class="label">a caveat this book carries forward, not hides</span>
+      This project's bit-ordering convention (first half of each symbol's bits map to
+      the I axis, second half to Q) is spectracuda's own choice. A bit-exact
+      cross-check against liquid-dsp's own modem module is still owed — the reference
+      C library isn't buildable in this environment (no autoconf/automake/libtool/cmake
+      installed) — so that ordering has <em>not</em> been verified to match liquid-dsp's.
+      The constellation geometry and power normalization are independently
+      standard-derived and correct regardless.</div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="chapter prose" id="ch6">
+      <div class="chapnum">Chapter 06 — Part I</div>
+      <h2>FEC, LDPC &amp; Interleaving</h2>
+
+      <p class="lede">A CRC only tells a receiver <em>that</em> a frame is wrong, never
+      how to fix it. Forward error correction is the layer that can actually recover
+      from channel noise — trading transmitted bits (redundancy) for the ability to
+      correct errors after the fact, without asking for a retransmission.</p>
+
+      <h3>The three schemes, in one table</h3>
+      <div class="tablewrap"><table class="spec">
+        <thead><tr><th><code>fec=</code> value</th><th>What it is</th><th>liquid-dsp precedent</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">"conv_v27"</td><td>Rate-1/2, constraint-length-7 convolutional code, hard-decision Viterbi decode</td><td>yes — <code>LIQUID_FEC_CONV_V27</code>, exact parity</td></tr>
+          <tr><td class="mono">"rs_m8"</td><td>Reed-Solomon(255, 223) over GF(256)</td><td>yes — <code>LIQUID_FEC_RS_M8</code>, exact parity</td></tr>
+          <tr><td class="mono">"ldpc_648_r12" … "ldpc_1944_r56"</td><td>12-variant IEEE 802.11n QC-LDPC family (3 block lengths × 4 rates), normalized min-sum belief-propagation decode</td><td><strong>no</strong> — deliberate scope expansion beyond liquid-dsp, which has no LDPC (or Polar) at all</td></tr>
+        </tbody>
+      </table></div>
+
+      <p>Convolutional and Reed-Solomon are both direct liquid-dsp parity — matched
+      exactly, not reduced subsets of what liquid-dsp offers. LDPC is new ground:
+      liquid-dsp simply doesn't have it, so this codebase designs the full 12-variant
+      family from the IEEE 802.11n standard reference rather than leaving the gap
+      unaddressed. It's also the first FEC codec in this codebase whose iterative
+      decode core is genuinely GPU-batched across <code>(n_batch, ...)</code> via
+      gather-only <code>self.xp</code> operations, rather than Reed-Solomon's inherently
+      sequential per-codeword Python loop — see <code>spectracuda/fec/ldpc.py</code>'s
+      module docstring.</p>
+
+      <div class="codewrap"><div class="code-label">python</div><pre class="code"><code><span class="tok-k">from</span> spectracuda.pipeline <span class="tok-k">import</span> Ofdm
+
+ofdm = Ofdm(
+    fft_size=<span class="tok-s">256</span>, n_pilot=<span class="tok-s">8</span>, n_data=<span class="tok-s">216</span>, cp_len=<span class="tok-s">32</span>, modem=<span class="tok-s">"qpsk"</span>,
+    fec=<span class="tok-s">"ldpc_648_r12"</span>, crc=<span class="tok-s">"crc16"</span>,
+    sync=<span class="tok-s">"schmidl_cox"</span>, cfo=<span class="tok-s">"schmidl_cox"</span>,
+)</code></pre></div>
+
+      <div class="callout"><span class="label">a "fail loud" convention, not a silent best-effort</span>
+      When a codeword has more errors than the decoded scheme can correct,
+      <code>Ofdm.rx_process()</code> raises <code>ValueError</code> rather than returning a
+      garbage best guess — the same convention this codebase's LDPC/Reed-Solomon
+      decoders already document for their own capacity limits. A caller has to
+      explicitly decide what "uncorrectable" means for their use case (retry, drop,
+      log), rather than receiving silently-wrong bits with no signal anything went
+      wrong.</div>
+
+      <h3>Does it actually help? A real, measured answer</h3>
+      <p>Four schemes, one PHY config, one AWGN channel model, swept across SNR — 40
+      independent trials per point, each a genuine <code>generate_frame()</code> →
+      <code>Channel.process()</code> → <code>rx_process()</code> round trip, counted as a
+      failure on either a caught decode exception or a CRC miss:</p>
+
+      <figure class="scope">
+        <div class="scope-bar"><span class="dot"></span>FEC COMPARISON · FRAME ERROR RATE VS SNR · QPSK, fft_size=256</div>
+        <div class="scope-frame"><img src="__IMG_FEC_COMPARISON__" alt="A frame-error-rate-versus-SNR waterfall plot comparing four FEC schemes -- none, conv_v27, rs_m8, and ldpc_648_r12 -- for QPSK over an AWGN channel. The none and rs_m8 curves fall together around 10-12 dB SNR; conv_v27 and ldpc_648_r12 fall together roughly 4 dB earlier, around 6-8 dB."></div>
+        <figcaption>Real <code>Ofdm(fec=...)</code> + <code>Channel(snr_db=...)</code> +
+        <code>rx_process()</code>, 40 trials per (scheme, SNR) point, <code>crc16</code>
+        deciding pass/fail. Not a textbook BER curve reference image — every point is
+        a measured fraction of 40 real frame attempts.</figcaption>
+      </figure>
+
+      <p>Two real, measured things this curve shows, not asserted from theory:
+      <strong><code>conv_v27</code> and <code>ldpc_648_r12</code> both deliver a genuine ~4&nbsp;dB
+      coding gain</strong> over uncoded — reaching the same reliability roughly 4&nbsp;dB of
+      SNR earlier than <code>"none"</code> does. That's the actual payoff FEC exists for,
+      demonstrated here rather than just claimed.</p>
+
+      <p><strong><code>rs_m8</code> alone barely helps at all</strong> against this channel — its
+      curve tracks <code>"none"</code> almost exactly. This isn't a bug; it's
+      Reed-Solomon behaving exactly as RS theory predicts. RS corrects <em>symbol</em>
+      errors (each GF(256) symbol is 8 bits), and it can correct up to
+      <code>(n-k)/2 = 16</code> wrong symbols per 255-symbol codeword regardless of how
+      many bits are wrong <em>within</em> those symbols. Scattered, independent random
+      bit errors from AWGN don't concentrate into a small number of symbols — they
+      spread thinly across many, and a codeword with, say, 40 different symbols each
+      carrying one wrong bit exceeds RS's 16-symbol correction budget even though only
+      40 of 2040 bits are actually wrong. RS is a <em>burst</em>-error code; against
+      uniformly scattered bit errors it isn't the right tool used alone — which is
+      exactly why real systems pair it with an inner code.</p>
+
+      <div class="callout caveat"><span class="label">read this curve for what it actually measured, not more</span>
+      One PHY config, one payload size per scheme (chosen to satisfy each scheme's
+      own block-size constraint, not rate-matched to carry identical net information
+      across schemes), pure AWGN with no multipath or burst structure. This
+      demonstrates real, qualitative coding gain and RS's real weakness against
+      scattered bit errors — it is not a rate-normalized Shannon-bound comparison, and
+      no burst/fading channel exists yet in <code>spectracuda.sim.Channel</code> to
+      demonstrate RS's actual strength against bursty errors directly (see the
+      two-stage section below for where that strength is supposed to show up instead).</div>
+
+      <h3>Two-stage FEC: why <code>fec0</code>/<code>fec1</code> order genuinely matters</h3>
+      <p>A second, outer FEC stage (<code>fec1=</code>) is supported, mirroring
+      liquid-dsp's own <code>packetizer</code> inner/outer composition:</p>
+
+      <div class="codewrap"><div class="code-label">python</div><pre class="code"><code>ofdm = Ofdm(
+    fft_size=<span class="tok-s">256</span>, n_pilot=<span class="tok-s">8</span>, n_data=<span class="tok-s">216</span>, cp_len=<span class="tok-s">32</span>, modem=<span class="tok-s">"qpsk"</span>,
+    fec=<span class="tok-s">"rs_m8"</span>, fec1=<span class="tok-s">"conv_v27"</span>,          <span class="tok-c"># fec0 = inner, fec1 = outer</span>
+    interleaver=<span class="tok-s">"block"</span>, interleaver_kwargs={<span class="tok-s">"unit_bits"</span>: <span class="tok-s">8</span>},
+)</code></pre></div>
+
+      <p><code>fec0</code> (<code>fec=</code>) is applied <strong>first</strong> on encode and
+      decoded <strong>last</strong>; <code>fec1</code> is applied <strong>second</strong> — closest
+      to the channel — and decoded <strong>first</strong>. Given the previous section's real
+      result (RS alone barely helps against scattered bit errors, Viterbi gives a real
+      ~4&nbsp;dB gain), the classic concatenated-coding benefit needs Viterbi to be the
+      code that actually faces the channel and Reed-Solomon to mop up whatever bursty
+      residue a Viterbi decode error leaves behind — which means <strong>Viterbi must be
+      <code>fec1</code> and Reed-Solomon must be <code>fec0</code></strong>: <code>fec="rs_m8",
+      fec1="conv_v27"</code>, not the reverse. Getting this backwards doesn't error out
+      — it just quietly gives up the benefit the combination exists for.</p>
+
+      <p><code>interleaver_kwargs={"unit_bits": 8}</code> matters for the same reason,
+      not just style: interleaving at individual-bit granularity can make a
+      byte-oriented outer code (RS) <em>worse</em> off, not better — it fragments a few
+      concentrated byte errors into many more scattered ones, working directly
+      against RS's own strength. <code>interleaver=</code> picks from <code>"block"</code>
+      (recommended default), <code>"permutation"</code>, <code>"convolutional"</code>, or
+      <code>"liquid"</code> (a verified port of liquid-dsp's own <code>interleaver.c</code>
+      algorithm).</p>
+
+      <div class="callout"><span class="label">a wrong assumption, caught during development, not shipped silently</span>
+      The <code>unit_bits=8</code> requirement above wasn't obvious from the start — see
+      <code>docs/todo.md</code> §1.12 for the full derivation of how a bit-granularity
+      interleaver was initially assumed fine, then found to actively hurt a
+      byte-oriented outer code once tested directly. Worth reading if you're deciding
+      how to configure <code>interleaver_kwargs=</code> for your own <code>fec0</code>/
+      <code>fec1</code> combination.</div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="chapter prose" id="coming-phy">
+      <div class="chapnum">Part I, continued</div>
+      <h2>Coming next: framing and streaming</h2>
+      <p class="lede">These chapters aren't written yet — rather than leave a blank
+      space, here's what each will cover and where to read the real material right now.</p>
+
+      <div class="nextup">
+        <div class="nextup-item">
+          <h4>07 — Framing &amp; the Header</h4>
+          <p>The 112-bit liquid-dsp-style frame header, the deframer, and how
+          <code>rx_process()</code> tells a genuinely-absent frame apart from a corrupted one.</p>
+          <p class="refs"><code>docs/todo.md §1.1</code></p>
+        </div>
+        <div class="nextup-item">
+          <h4>08 — Streaming Receive</h4>
+          <p><code>Ofdm.rx_streaming(chunk)</code> — a real chunked receiver state machine
+          (SEEKING → WAITING_HEADER → WAITING_PAYLOAD), modeled directly on liquid-dsp's
+          own <code>ofdmframesync_execute()</code>, additive alongside the batch
+          <code>rx_process()</code> every other chapter in Part I has used.</p>
+          <p class="refs"><code>examples/mac_streaming_demo.py</code> · <code>docs/todo.md §2.5</code></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="chapter prose" id="coming-mac">
+      <div class="chapnum">Part II — not yet written</div>
+      <h2>Coming next: the MAC layer</h2>
+      <p class="lede">liquid-dsp has no MAC/RLC concept at all — this is new ground,
+      named after 3GPP RLC's TM/UM/AM modes for the behavior they describe (raw
+      passthrough / numbered best-effort / numbered-with-retransmission), not as a
+      spec-accurate implementation.</p>
+
+      <div class="nextup">
+        <div class="nextup-item">
+          <h4>09 — TM / UM / AM</h4>
+          <p>The 32-bit PDU header, segmentation and reassembly, and the three
+          entities' genuinely different method surfaces — why AM needs four methods
+          where TM/UM need two.</p>
+          <p class="refs"><code>docs/mac.md</code></p>
+        </div>
+        <div class="nextup-item">
+          <h4>10 — Two Independent Radios</h4>
+          <p><code>Mac(mode=, ofdm_kwargs=)</code> — each <code>Mac</code> owning its own,
+          genuinely independent <code>Ofdm</code>, so two real endpoints are two separate
+          objects with zero shared identity, IQ as the only thing crossing between them.</p>
+          <p class="refs"><code>examples/mac_two_units_demo.py</code></p>
+        </div>
+        <div class="nextup-item">
+          <h4>11 — Binding &amp; Link Quality</h4>
+          <p>The real BIND_REQUEST/BIND_RESPONSE handshake and why a genuinely
+          independent second <code>Mac</code> was needed before mismatch-rejection could be
+          proven through the actual wire mechanism, not just as a pure function.</p>
+          <p class="refs"><code>docs/mac.md, "Binding + link-quality reporting"</code></p>
+        </div>
+        <div class="nextup-item">
+          <h4>12 — Bidirectional AM</h4>
+          <p>The full 4-Mac/4-Ofdm picture: why AM's STATUS/retransmission round trip
+          needs a second Mac/Ofdm pair per direction, the STATUS-routes-the-other-way
+          wrinkle, and the same scenario over both batch and streaming receive.</p>
+          <p class="refs"><code>examples/mac_bidirectional_am_batch_demo.py</code> · <code>mac_bidirectional_am_streaming_demo.py</code></p>
+        </div>
+      </div>
+    </section>
+
+    <section class="prose" id="colophon">
+      <h3>About this book</h3>
+      <p style="font-size:14.5px;color:var(--text-muted);">Figures generated by
+      <code>docs/book_figures/generate_figures.py</code>, run against spectracuda on
+      <code>backend="numpy"</code> (no GPU required to reproduce any figure here — every
+      block accepts <code>backend="cupy"</code> explicitly on CUDA-capable hardware).
+      Code snippets are copy-pasteable against the real API as of this writing. Report
+      drift between this book and the actual code as you'd report any other doc bug.</p>
+    </section>
+
+    <footer class="book-footer">
+      spectracuda — GPU-accelerated, liquid-dsp-inspired SDR PHY+MAC · docs/architecture.md · docs/mac.md · docs/todo.md
+    </footer>
+  </main>
+</div>
+
+<script>
+  (function () {
+    try {
+      var root = document.documentElement;
+      var saved = localStorage.getItem("spectracuda-book-theme");
+      if (saved === "light" || saved === "dark") {
+        root.setAttribute("data-theme", saved);
+      }
+      var buttons = document.querySelectorAll(".theme-toggle button");
+      function setActive(choice) {
+        buttons.forEach(function (b) {
+          b.classList.toggle("active", b.getAttribute("data-theme-choice") === choice);
+        });
+      }
+      setActive(saved || "system");
+      buttons.forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var choice = btn.getAttribute("data-theme-choice");
+          if (choice === "system") {
+            root.removeAttribute("data-theme");
+            try { localStorage.removeItem("spectracuda-book-theme"); } catch (e) {}
+          } else {
+            root.setAttribute("data-theme", choice);
+            try { localStorage.setItem("spectracuda-book-theme", choice); } catch (e) {}
+          }
+          setActive(choice);
+        });
+      });
+    } catch (e) {
+      /* localStorage unavailable (private window, blocked site data) -- theme
+         toggle still works for the current view, just doesn't persist. */
+    }
+  })();
+
+  (function () {
+    try {
+      var links = document.querySelectorAll(".navlist a[href^='#']");
+      var sections = Array.prototype.slice.call(document.querySelectorAll("section.chapter[id], section.prose[id]"));
+      function onScroll() {
+        var pos = window.scrollY + 120;
+        var current = sections[0];
+        sections.forEach(function (s) { if (s.offsetTop <= pos) current = s; });
+        links.forEach(function (l) {
+          l.classList.toggle("current", l.getAttribute("href") === "#" + current.id);
+        });
+      }
+      document.addEventListener("scroll", onScroll, { passive: true });
+      onScroll();
+    } catch (e) {}
+  })();
+</script>

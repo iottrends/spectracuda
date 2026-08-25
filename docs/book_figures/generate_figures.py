@@ -363,10 +363,91 @@ def fig_constellation_gallery():
     _save(fig, "constellation_gallery")
 
 
+# =========================================================================
+# Figure 6: FEC comparison -- real frame error rate vs SNR, 4 schemes
+# =========================================================================
+def fig_fec_comparison():
+    print("fig_fec_comparison (this one takes ~20-30s -- real repeated trials)...")
+    from spectracuda.pipeline import Ofdm as _Ofdm  # local alias, avoids shadowing
+
+    PHY = dict(
+        fft_size=256, n_pilot=8, n_data=216, cp_len=32, modem="qpsk",
+        crc="crc16", sync="schmidl_cox", cfo="schmidl_cox",
+        channel_estimator="ls", equalizer="mmse", n_training_symbols=2, backend="numpy",
+    )
+    # Payload sizes are NOT arbitrary -- each must (a) be a multiple of 8
+    # (crc16 is byte-oriented) and (b) make (payload + 16 crc bits) an
+    # exact multiple of that scheme's own block size (rs_m8: 1784 bits/
+    # block; ldpc_648_r12: 324 bits/codeword, so 2 codewords = 648 bits of
+    # (payload+crc) -> payload=632). Getting this wrong raises a real,
+    # loud ValueError at generate_frame() time -- verified by hand before
+    # being hardcoded here, not guessed.
+    schemes = {
+        "none": 400,
+        "conv_v27": 400,
+        "rs_m8": 1768,
+        "ldpc_648_r12": 632,
+    }
+    snr_points = list(range(0, 20, 2))
+    n_trials = 40
+
+    results = {}
+    for fec, n_bits in schemes.items():
+        ofdm = _Ofdm(**PHY, fec=fec)
+        fer = []
+        for snr in snr_points:
+            n_fail = 0
+            for trial in range(n_trials):
+                rng = np.random.default_rng(1000 * snr + trial)
+                bits = rng.integers(0, 2, size=(1, n_bits)).astype("uint8")
+                tx_iq = ofdm.generate_frame(bits)
+                # Trailing silence -- see fig_channel_equalization()'s note
+                # on the real late-detected-start edge case this avoids.
+                tx_iq = np.concatenate([tx_iq, np.zeros((1, 300), dtype=tx_iq.dtype)], axis=-1)
+                channel = Channel(snr_db=float(snr), seed=trial, backend="numpy")
+                rx_iq = channel.process(tx_iq)
+                try:
+                    result = ofdm.rx_process(rx_iq)
+                    ok = (
+                        bool(np.asarray(result["frame_found"]))
+                        and result["crc_valid"] is not None
+                        and bool(np.asarray(result["crc_valid"])[0])
+                    )
+                except (ValueError, NotImplementedError):
+                    # An uncorrectable codeword raises rather than silently
+                    # returning garbage (this codebase's "fail loud" FEC
+                    # convention) -- counted as a frame failure here, same
+                    # as a CRC miss, which is what it functionally is.
+                    ok = False
+                if not ok:
+                    n_fail += 1
+            fer.append(n_fail / n_trials)
+        results[fec] = fer
+        print(f"  {fec:14s} " + " ".join(f"{v:.2f}" for v in fer))
+
+    fig, ax = plt.subplots(figsize=(8.5, 5))
+    styles = {
+        "none": dict(color=RED, marker="o", label="none (uncoded)"),
+        "conv_v27": dict(color=AMBER, marker="s", label="conv_v27 (Viterbi, liquid-dsp parity)"),
+        "rs_m8": dict(color=VIOLET, marker="^", label="rs_m8 (Reed-Solomon, liquid-dsp parity)"),
+        "ldpc_648_r12": dict(color=TEAL, marker="D", label="ldpc_648_r12 (rate 1/2, beyond liquid-dsp)"),
+    }
+    for fec, fer in results.items():
+        s = styles[fec]
+        ax.plot(snr_points, fer, linewidth=1.6, markersize=5, **s)
+    ax.set_xlabel("channel SNR (dB)")
+    ax.set_ylabel(f"frame error rate  ({n_trials} independent trials/point)")
+    ax.set_ylim(-0.03, 1.03)
+    ax.set_title("Real frame error rate vs. SNR — QPSK, fft_size=256, crc16", fontsize=12)
+    ax.legend(facecolor=BG, edgecolor=GRID, labelcolor=TEXT, fontsize=9, loc="upper right")
+    _save(fig, "fec_comparison")
+
+
 if __name__ == "__main__":
     fig_sync_metric()
     fig_cfo_rotation()
     fig_cfo_recovered()
     fig_channel_equalization()
     fig_constellation_gallery()
+    fig_fec_comparison()
     print("done.")

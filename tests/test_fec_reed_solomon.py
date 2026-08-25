@@ -92,15 +92,56 @@ def test_over_capacity_errors_detected_not_silently_wrong():
 
 
 def test_wrong_message_length_raises():
+    """100 used to be the "wrong length" example here -- it no longer
+    is: shortened RS (see reed_solomon.py's encode()/decode() docstrings)
+    now accepts any 1..223, so the genuinely out-of-range boundary moved
+    to 0 and >223."""
     rs = _rs()
     with pytest.raises(ValueError):
-        rs.encode(np.zeros((1, 100), dtype="uint8"))
+        rs.encode(np.zeros((1, 0), dtype="uint8"))
+    with pytest.raises(ValueError):
+        rs.encode(np.zeros((1, 224), dtype="uint8"))
 
 
 def test_wrong_codeword_length_raises():
+    """Same shift as above -- a decode() length is only invalid now if
+    the implied real_k (length - 32) falls outside 1..223."""
     rs = _rs()
     with pytest.raises(ValueError):
-        rs.decode(np.zeros((1, 100), dtype="uint8"))
+        rs.decode(np.zeros((1, 32), dtype="uint8"))  # real_k would be 0
+    with pytest.raises(ValueError):
+        rs.decode(np.zeros((1, 256), dtype="uint8"))  # real_k would be 224
+
+
+def test_shortened_round_trip_various_lengths():
+    """The actual new behavior this file didn't cover before: a message
+    genuinely shorter than 223 bytes round-trips, and the transmitted
+    codeword is real_k + 32 -- NOT padded up to the full 255, which is
+    the entire point (see docs/mac.md's writeup of the real bug this
+    closes -- a 13-byte bind request no longer needs to become 255
+    bytes on the wire)."""
+    rs = _rs()
+    rng = np.random.default_rng(3)
+    for real_k in (1, 13, 100, 223):
+        msg = rng.integers(0, 256, size=(1, real_k)).astype("uint8")
+        codeword = rs.encode(msg)
+        assert codeword.shape[-1] == real_k + 32
+        np.testing.assert_array_equal(rs.decode(codeword), msg)
+
+
+def test_shortened_still_corrects_up_to_t_errors():
+    """Real error-correction power isn't reduced by shortening -- the
+    same t=16 symbol-error budget still applies, proven with real
+    injected errors, not assumed from the encode/decode symmetry alone."""
+    rs = _rs()
+    rng = np.random.default_rng(4)
+    msg = rng.integers(0, 256, size=(1, 13)).astype("uint8")
+    codeword = rs.encode(msg)
+    corrupted = codeword.copy()
+    positions = rng.choice(codeword.shape[-1], size=rs.t, replace=False)
+    for p in positions:
+        corrupted[0, p] ^= 0xFF
+    np.testing.assert_array_equal(rs.decode(corrupted), msg)
 
 
 def test_process_is_alias_for_encode():

@@ -54,6 +54,7 @@ book/ch02_synchronization
 book/ch03_cfo
 book/ch04_channel_estimation
 book/ch05_modem
+book/ch06_fec_ldpc
 book/roadmap
 ```
 

@@ -24,6 +24,9 @@ dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 # published site (spectracuda.readthedocs.io, see docs/conf.py) -- none of
 # this is ever imported by spectracuda itself.
 docs = ["matplotlib>=3.8", "sphinx>=7.0", "myst-parser>=2.0", "sphinx-rtd-theme>=2.0", "sphinx-copybutton>=0.5"]
+# pyzmq is dev/example-only, used by examples/drone_ground_unit.py and
+# drone_air_unit.py's IQ transport -- never imported by spectracuda itself.
+examples = ["pyzmq>=25.0"]
 
 [tool.setuptools.packages.find]
 include = ["spectracuda*"]

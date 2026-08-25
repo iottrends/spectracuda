@@ -57,13 +57,40 @@ than those, so RS decode throughput will scale with batch size less
 favorably than Viterbi's per-timestep-vectorized decode does. Flagged
 as a known, documented limitation rather than a hidden one.
 
-Batch-shape contract: encode(msg) takes (n_batch, 223) uint8 symbols ->
-(n_batch, 255) uint8 codeword symbols. decode(codeword) takes
-(n_batch, 255) uint8 (possibly with up to 16 symbol errors per codeword)
--> (n_batch, 223) uint8 decoded message symbols. Raises ValueError if a
-codeword has more errors than can be corrected (detected via the
-Berlekamp-Massey-degree/Chien-search-root-count mismatch above) rather
-than silently returning wrong data.
+Batch-shape contract: encode(msg) takes (n_batch, real_k) uint8 symbols,
+for any 1 <= real_k <= 223 -> (n_batch, real_k + 32) uint8 codeword
+symbols. decode(codeword) takes (n_batch, real_k + 32) uint8 (possibly
+with up to 16 symbol errors) -> (n_batch, real_k) uint8 decoded message
+symbols. real_k == 223 is the original, full-length behavior
+(codeword length 255), unchanged. Raises ValueError if a codeword has
+more errors than can be corrected (detected via the Berlekamp-Massey-
+degree/Chien-search-root-count mismatch above) rather than silently
+returning wrong data.
+
+Shortening (real_k < 223): a real bug this closed, not a preemptive
+feature -- Mac(ofdm_kwargs=dict(fec="rs_m8", ...)) could not send
+anything at all before this existed, not even its own bind handshake
+(104 bits, nowhere near 223 bytes), because the ONLY thing this class
+used to accept was an exact 223-symbol message (see docs/mac.md's
+writeup). Padding every short message up to 223 bytes was considered and
+rejected (a 13-byte bind request would become 255 bytes on the wire --
+17x waste on a real link, not a free fix). "Shortened" Reed-Solomon is
+the actual standard technique instead (used in e.g. CCSDS): treat the
+missing (223 - real_k) symbols as known, IMPLICIT leading zeros --
+compute the real 32 parity symbols against them exactly as the full-
+length case does (this class's own encode/decode math needs zero
+changes for this, since it's already systematic -- see _encode_one/
+encode() below, output is literally concatenate([message, parity])) --
+but never transmit those implicit zeros. Only [real_k message symbols |
+32 parity symbols] cross the air. decode() recovers real_k directly from
+the codeword's OWN length (real_k = len(codeword) - 32) -- no separate
+length parameter needed, reinserts the same implicit zeros, runs the
+exact same decode logic, then drops them back off the result. Error-
+correction power is UNCHANGED by shortening (still up to t=16 symbol
+errors per codeword, proven with real injected errors at a shortened
+length in tests/test_fec_reed_solomon.py, not just claimed from the
+encode/decode symmetry) -- shortening only removes symbols that were
+always zero, it doesn't touch the redundancy budget.
 """
 from __future__ import annotations
 
@@ -138,10 +165,11 @@ class ReedSolomonCode(Block):
         self.nroots = _NROOTS
         self.t = _NROOTS // 2  # max correctable symbol errors per codeword
         self.batch_shape_doc = (
-            f"encode: (n_batch, {_K}) uint8 symbols -> (n_batch, {_N}) uint8 "
-            f"symbols. decode: (n_batch, {_N}) uint8 symbols (up to "
-            f"{_NROOTS // 2} symbol errors each) -> (n_batch, {_K}) uint8 "
-            f"decoded symbols."
+            f"encode: (n_batch, real_k) uint8 symbols for any 1<=real_k<={_K} "
+            f"(\"shortened\" RS -- see module docstring) -> (n_batch, "
+            f"real_k+{_NROOTS}) uint8 symbols. decode: the inverse (up to "
+            f"{_NROOTS // 2} symbol errors per codeword); real_k = {_N} is "
+            f"the original full-length behavior, unchanged."
         )
 
     def _encode_one(self, msg_row: np.ndarray) -> np.ndarray:
@@ -157,15 +185,29 @@ class ReedSolomonCode(Block):
         return np.array(parity, dtype="uint8")
 
     def encode(self, msg: Any) -> Any:
+        """msg: (n_batch, real_k) for any 1 <= real_k <= K -- "shortened"
+        Reed-Solomon (see module docstring's "Shortening" section):
+        real_k < K is treated as if (K - real_k) leading zero symbols
+        were really there (a standard technique, e.g. CCSDS), but those
+        synthetic zeros are computed against, never RETURNED/transmitted
+        -- output is (n_batch, real_k + NROOTS), not always (n_batch, N).
+        real_k == K (full-length) is the unchanged original behavior,
+        byte-identical to before this was added."""
         xp = self.xp
         host_msg = np.asarray(msg, dtype="uint8")
         if host_msg.ndim == 1:
             host_msg = host_msg[None, :]
-        if host_msg.shape[-1] != _K:
-            raise ValueError(f"expected {_K} message symbols, got {host_msg.shape[-1]}")
+        real_k = host_msg.shape[-1]
+        if not (1 <= real_k <= _K):
+            raise ValueError(f"expected 1..{_K} message symbols, got {real_k}")
         n_batch = host_msg.shape[0]
-        parity = np.stack([self._encode_one(host_msg[b]) for b in range(n_batch)])
-        codeword = np.concatenate([host_msg, parity], axis=-1)
+        if real_k < _K:
+            pad = np.zeros((n_batch, _K - real_k), dtype="uint8")
+            full_msg = np.concatenate([pad, host_msg], axis=-1)
+        else:
+            full_msg = host_msg
+        parity = np.stack([self._encode_one(full_msg[b]) for b in range(n_batch)])
+        codeword = np.concatenate([host_msg, parity], axis=-1)  # real symbols only, never the padding
         return xp.asarray(codeword)
 
     def _syndromes_one(self, codeword_row: np.ndarray) -> list:
@@ -275,16 +317,39 @@ class ReedSolomonCode(Block):
         return corrected[:_K]
 
     def decode(self, codeword: Any) -> Any:
+        """codeword: (n_batch, real_k + NROOTS) for any 1 <= real_k <= K --
+        the shortened-codeword inverse of encode() above. real_k is
+        recovered directly from the input's own length (codeword length
+        - NROOTS) -- no separate length parameter needed, since a
+        shortened codeword's length already determines it uniquely. The
+        (K - real_k) synthetic zero symbols encode() computed against are
+        reinserted before running the SAME decode logic full-length
+        codewords already use (syndromes/Berlekamp-Massey/Chien search/
+        error-magnitude solve -- none of that changes), then sliced back
+        off before returning. real_k == K (full-length) is the unchanged
+        original behavior."""
         xp = self.xp
         host_codeword = np.asarray(
             codeword if self.backend != "cupy" else self._to_host(codeword), dtype="uint8"
         )
         if host_codeword.ndim == 1:
             host_codeword = host_codeword[None, :]
-        if host_codeword.shape[-1] != _N:
-            raise ValueError(f"expected {_N} codeword symbols, got {host_codeword.shape[-1]}")
+        real_k = host_codeword.shape[-1] - _NROOTS
+        if not (1 <= real_k <= _K):
+            raise ValueError(
+                f"expected {1 + _NROOTS}..{_N} codeword symbols (real_k + "
+                f"{_NROOTS} for 1 <= real_k <= {_K}), got {host_codeword.shape[-1]}"
+            )
         n_batch = host_codeword.shape[0]
-        decoded = np.stack([self._decode_one(host_codeword[b]) for b in range(n_batch)])
+        if real_k < _K:
+            pad = np.zeros((n_batch, _K - real_k), dtype="uint8")
+            message_part = host_codeword[:, :real_k]
+            parity_part = host_codeword[:, real_k:]
+            full_codeword = np.concatenate([pad, message_part, parity_part], axis=-1)
+        else:
+            full_codeword = host_codeword
+        decoded_full = np.stack([self._decode_one(full_codeword[b]) for b in range(n_batch)])
+        decoded = decoded_full[:, _K - real_k:]  # drop the synthetic leading zeros
         return xp.asarray(decoded)
 
     def _to_host(self, arr: Any) -> np.ndarray:

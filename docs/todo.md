@@ -237,6 +237,54 @@ values. Missing, still a real parity gap:
   correct, but leaves real coding gain on the table versus a future
   soft-input pathway (see `ldpc.py`'s module docstring).
 
+- [x] **`rs_m8` now supports "shortened" codewords — a real, load-bearing
+  bug found and fixed, not a preemptive feature.** Discovered while
+  wiring up a real `Mac(ofdm_kwargs=dict(fft_size=256, modem="qam16",
+  fec="rs_m8", fec1="conv_v27", ...))` config (a two-process drone-link
+  demo): `rs_m8` used to accept *only* an exact 223-byte message — not
+  even its own bind handshake (104 bits) could be sent, since nothing
+  short of a full block was ever valid. Padding every short message up
+  to 223 bytes was considered and explicitly rejected (17x waste on a
+  real link for a 13-byte message). Fixed with the actual standard
+  technique instead — shortened Reed-Solomon (used in e.g. CCSDS): treat
+  a message shorter than 223 bytes as if `(223 - real_k)` leading zero
+  bytes were really there, compute the real 32 parity bytes against
+  them (needs zero changes to the core GF(256) math — `ReedSolomonCode`
+  was already systematic), but never transmit those implicit zeros —
+  only `real_k + 32` bytes cross the air, scaling with the real message,
+  not the block size. `spectracuda/fec/reed_solomon.py`'s `encode()`/
+  `decode()` now accept any `1 <= real_k <= 223` (`decode()` recovers
+  `real_k` directly from the codeword's own length, no new parameter
+  needed); `spectracuda/fec/fec.py`'s wrapper now handles a message as
+  N full blocks + at most one shortened leftover block (the same
+  mechanism serves both the tiny-bind-request case and the leftover-
+  segment-of-a-big-message case); a second, smaller real bug caught
+  *while building this fix* (not by inspection): a byte-**mis**aligned
+  leftover length (e.g. 100 bits) used to silently succeed through
+  `np.packbits`'s implicit zero-padding and come back wrong on decode,
+  not loud — now raises `ValueError` explicitly, same "fail loud, don't
+  guess" convention as the rest of this codebase's FEC code.
+  `spectracuda/mac/capacity.py`'s `compute_max_segment_bits()` had
+  needed a stopgap "search whole blocks only" workaround for exactly
+  this gap (an intermediate real fix in its own right, since arbitrary
+  bisected guesses almost never land on an exact block multiple and the
+  search was collapsing to an 8-bit floor) — simplified back to its
+  original plain search now that `rs_m8` genuinely accepts any
+  byte-aligned length; `FEC.accepts_partial_block` (new attribute) is
+  what lets `capacity.py` tell `rs_m8` (now `True`) apart from LDPC
+  (still `False` — see below).
+  **Explicitly out of scope, a separate documented gap, not silently
+  left behind**: every `ldpc_*` variant hits the identical "exact
+  multiple only" wall through `Mac(ofdm_kwargs=...)` — confirmed
+  directly, same symptom, same root cause — but LDPC's parity-check-
+  matrix structure isn't the same simple systematic-zero-pad case RS is,
+  so "shortening" it isn't the same fix. Still broken for `Mac`+LDPC
+  today. Regression tests: `tests/test_fec_reed_solomon.py`,
+  `tests/test_fec.py`, and `tests/test_mac_block_oriented_fec.py` (the
+  full real config — bind handshake, a short message, and a
+  multi-segment message, all through `Mac`+`rs_m8`+`conv_v27` — none of
+  which could complete at all before this fix).
+
 ### 1.9 Layer 1 infra — implemented, lower priority to revisit
 `OfdmModulator`/`OfdmDemodulator` (FFT/IFFT + CP) and `ResourceGrid`
 (pilot/data/null mapping) are done and match liquid-dsp's
@@ -584,6 +632,80 @@ contract") and is UNCHANGED — `rx_streaming()` is additive.
       proactively, worth noting since it means this had been stale for a
       while without being caught by testing (docs aren't covered by the
       test suite by nature).
+
+### 2.8 Tutorial book — Part I done (PHY chain), Part II outlined
+- [x] **"The OFDM Field Guide"** — a PySDR-style tutorial, published as an
+      interactive HTML artifact (linked from `README.md`'s new "The book"
+      section), spectracuda-focused rather than ground-up (assumes basic
+      DSP/SDR literacy, points to PySDR itself for that). Part I (the
+      Ofdm object, synchronization, CFO, channel estimation/equalization,
+      the modem) is fully written, each chapter grounded in a real,
+      generated figure — `docs/book_figures/generate_figures.py` imports
+      spectracuda's actual classes (`Modem`, `SchmidlCoxSync`, `Ofdm`,
+      `Channel`) and runs them; nothing is a hand-drawn illustration. Two
+      real things worth recording, found while building the figures (not
+      library bugs, but real, measured facts a reader benefits from
+      knowing):
+      - The real `SchmidlCoxCFO` estimator has a narrower reliable range
+        than an illustrative offset does — swept empirically at 25 dB SNR,
+        this implementation decodes correctly through ~1.0 subcarrier of
+        offset and fails past ~1.5. The book's CFO chapter states this
+        measured range explicitly rather than picking a flattering number.
+      - A long payload through a real multipath channel can shift the
+        detected frame start a few samples later than the noiseless case
+        (delay spread), and `generate_frame()`'s output has zero built-in
+        trailing margin beyond exactly what a nominal-start decode needs —
+        a late-detected start then runs the last payload symbol past the
+        end of the buffer. Worked around in the figure script by padding
+        trailing silence (as any real captured buffer would have); the
+        underlying question of how much margin a streaming capture should
+        keep by default is still open, adjacent to #1.11 above, not fixed
+        here.
+      Part II (the MAC layer: TM/UM/AM, two independent radios, binding,
+      bidirectional AM) is outlined in the book's nav with "coming soon"
+      tags and real pointers to `docs/mac.md`/`examples/`, not written yet
+      — disclosed honestly rather than left blank or faked.
+      `pyproject.toml` gained a `docs` extra (`matplotlib`, dev-only,
+      never imported by `spectracuda` itself) to make figure regeneration
+      reproducible.
+- [x] **Live hosted docs site (spectracuda.readthedocs.io) + the book now
+      exists in two synchronized forms.** `docs/conf.py`/`.readthedocs.yaml`
+      set up a Sphinx+MyST build (parses `docs/*.md` unchanged, plus a new
+      `docs/book/*.md` directory holding the same chapters as the
+      standalone HTML artifact, MyST syntax instead of hand-authored HTML).
+      `docs/book_figures/book_template.html`/`build_book.py` (the
+      artifact's own source) were themselves missing from the repo at
+      first — built straight into an ephemeral scratchpad during the
+      original session — moved into `docs/book_figures/` once flagged, so
+      the whole book is now reproducible from source like everything else
+      here, not recoverable only by reading the published artifact back.
+- [x] **Chapter 06 — FEC, LDPC & Interleaving, written (both forms).**
+      `conv_v27`/`rs_m8` vs. liquid-dsp parity, the 12-variant LDPC family
+      as deliberate non-parity scope, the "fail loud" uncorrectable-
+      codeword convention, and the `fec0`/`fec1` two-stage ordering
+      requirement (`docs/todo.md` §1.12's own correction, cited directly
+      rather than re-derived). Centered on one real, measured figure — a
+      genuine frame-error-rate-vs-SNR sweep (`Ofdm(fec=...)` +
+      `Channel(snr_db=...)` + `rx_process()`, 40 real trials per point,
+      `conv_v27`/`rs_m8`/`ldpc_648_r12`/`none`) — not a textbook reference
+      curve. Two real, measured findings the chapter reports honestly:
+      `conv_v27` and `ldpc_648_r12` both show a genuine ~4 dB coding gain
+      over uncoded; `rs_m8` ALONE shows almost no gain at all against pure
+      AWGN, which is real RS behavior (a burst/symbol-oriented code has
+      little to work with against scattered independent bit errors, not a
+      bug) and the actual, measured reason a real system pairs it with an
+      inner code rather than using it alone — exactly the fec0/fec1
+      section's point, now backed by a real number instead of only
+      asserted. Getting there required finding each scheme's own valid
+      payload-size constraint by hand (`rs_m8`: exact multiples of 1784
+      bits; `ldpc_648_r12`: multiples of 324, forced to 632 bits of
+      payload once crc16's 16-bit/byte-alignment requirement is also
+      satisfied) and reusing the same late-detected-start trailing-margin
+      workaround the channel-equalization figure already needed. Verified
+      to actually build: a real `sphinx-build -b html docs ... -E -a` run
+      (forced, not relying on a possibly-stale cached environment) came
+      back clean, zero warnings, with the new chapter's table/figure/
+      admonitions all present in the rendered output.
 
 ---
 

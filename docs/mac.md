@@ -615,6 +615,89 @@ is what actually identifies the frame); BIND/STATUS pdus, always small,
 print in full. `tests/test_mac_bidirectional_am.py` unaffected — the
 returned result dicts are identical, only stdout changed.
 
+## `Mac(ofdm_kwargs=dict(fec="rs_m8", ...))` was completely unusable —
+## found, root-caused, and fixed for real (not padded around)
+
+Found while wiring up a real drone-link config (`fft_size=256,
+modem="qam16", fec="rs_m8", fec1="conv_v27",
+interleaver="block"/unit_bits=8` — full 802.11n-style two-stage FEC) for
+a two-process (`examples/drone_ground_unit.py`/`drone_air_unit.py`,
+still to be built) demo meant to exercise `Ofdm.rx_streaming()` over
+ZeroMQ. `Mac(mode="um", ofdm_kwargs=that_config)` derived
+`max_segment_bits = 8` — completely unusable — and even after a first
+fix, `build_bind_request()` itself raised. Full root-cause chain, each
+link independently verified before moving to the next (not assumed):
+
+1. `rs_m8` (RS(255,223)) only ever accepted an *exact* 223-byte message.
+   `Mac`'s capacity search (`spectracuda/mac/capacity.py`) probes
+   arbitrary byte-aligned sizes; almost none of those land on an exact
+   multiple of RS's 1784-bit block, each miss raised `ValueError`, and
+   the search — unable to tell "wrong shape" apart from "too big" —
+   collapsed to its floor (8 bits) for every `rs_m8`/LDPC config run
+   through `Mac`. **Confirmed via direct test**: no existing `Mac` test
+   anywhere in this repo had ever used `rs_m8`/LDPC (only `"none"` or
+   `conv_v27`, neither block-oriented) — a real, verified coverage gap,
+   not a hypothetical one.
+2. First fix (a real fix in its own right, kept as documented history):
+   make the search only ever try exact block multiples, so it can't hit
+   the "wrong shape" exception at all. This made `max_segment_bits`
+   correct — but exposed the deeper problem: `build_bind_request()`
+   still failed, because the bind handshake (104 bits) isn't, and was
+   never going to be, a multiple of 1784 bits. Nor is an ordinary short
+   message, or the leftover last segment of a longer one.
+3. The user rejected the obvious-looking next fix (pad every short
+   message up to 223 bytes) as real, unacceptable waste — 17x inflation
+   for a 13-byte bind request on what's meant to be a real, bandwidth-
+   constrained link. Correctly so: that's not a fix, it's hiding the
+   problem's cost.
+4. The actual fix: **shortened Reed-Solomon**, a real, standard
+   technique (e.g. CCSDS), not invented here — treat a short message as
+   if padded with *implicit, never-transmitted* zero bytes up to 223,
+   compute the real parity against them, but only ever send
+   `real_bytes + 32 parity bytes`. Confirmed cleanly buildable before
+   writing any code: `ReedSolomonCode.encode()` was already systematic
+   (`concatenate([message, parity])`), so shortening needed zero changes
+   to the actual GF(256) math — only to how much of the message is
+   really there. Implemented in `spectracuda/fec/reed_solomon.py`
+   (`encode()`/`decode()` now accept any `1 <= real_k <= 223`, `decode()`
+   recovers `real_k` from the codeword's own length — no new parameter,
+   no new wire-format field) and `spectracuda/fec/fec.py` (a message is
+   now N full blocks + at most one shortened leftover block, the same
+   mechanism serving both the tiny-bind-request case and a big message's
+   oddly-sized leftover segment).
+5. **A second real bug caught while building the fix, not by
+   inspection**: a byte-*mis*aligned leftover length (e.g. exactly 100
+   bits) used to silently succeed — `np.packbits` zero-pads instead of
+   raising — and come back wrong, not loud, on decode. Caught by testing
+   with non-zero random data (the original stale test used all-zero
+   data, which happens to hide exactly this class of bug — a zero-padded
+   *zero* message still decodes to zeros). Fixed with an explicit
+   byte-alignment check, same "fail loud" convention this codebase's FEC
+   code already follows elsewhere.
+6. `capacity.py`'s step-2 whole-block workaround (see #2 above) was then
+   simplified back to its original plain search for `rs_m8` specifically
+   — no longer needed once `rs_m8` genuinely accepts any byte-aligned
+   length — while staying in place for LDPC, which still needs it (see
+   below). A new `FEC.accepts_partial_block` attribute is what lets
+   `capacity.py` tell the two apart.
+
+**Deliberately out of scope, a documented separate gap, not silently
+left behind**: every `ldpc_*` variant hits the identical wall through
+`Mac(ofdm_kwargs=...)` (confirmed directly — same symptom, same root
+cause), but LDPC's parity-check-matrix structure isn't the same simple
+systematic-zero-pad case RS is, so shortening it isn't the same
+one-paragraph fix. Still broken for `Mac`+LDPC today — see
+`docs/todo.md` §1.8.
+
+Verified: `tests/test_fec_reed_solomon.py` (round trip + real injected-
+error correction at several shortened lengths, not just full-length),
+`tests/test_fec.py` (the `FEC` wrapper's multi-block-plus-leftover
+case), `tests/test_mac_block_oriented_fec.py` (the actual real-world
+proof — a real `Mac`+`rs_m8`+`conv_v27` bind handshake, a short message,
+and a multi-segment message, all of which failed outright before this
+fix and all pass now). Full suite: 600 passed, 1 pre-existing unrelated
+skip (up from 592 — 8 new tests, zero regressions).
+
 ## Verification, as actually run
 
 1. `pytest tests/test_mac_pdu.py tests/test_mac_tm.py tests/test_mac_um.py

@@ -80,6 +80,13 @@ class FEC(Block):
             raise ValueError(f"Unknown FEC scheme {scheme!r}; expected one of {sorted(_SCHEMES)}")
         self.scheme = scheme
         self._impl = _SCHEMES[scheme](backend=backend)
+        # k_bits alone doesn't say whether a non-multiple length is
+        # actually usable (rs_m8: yes, via shortening -- see
+        # encoded_length()'s docstring; ldpc_*: no, still exact-multiple
+        # only, a documented separate gap) -- callers like
+        # mac/capacity.py need this to know which search strategy is
+        # even correct to run.
+        self.accepts_partial_block = scheme in _SYMBOL_LEVEL_SCHEMES
 
         if scheme in _SYMBOL_LEVEL_SCHEMES:
             self.k_bits = self._impl.k * 8
@@ -112,8 +119,28 @@ class FEC(Block):
         return np.asarray(arr)
 
     def encoded_length(self, k: int) -> int:
-        """Bit count encode() produces for a given raw bit count k."""
-        if self.scheme in _SYMBOL_LEVEL_SCHEMES or self.scheme in _BLOCK_BIT_SCHEMES:
+        """Bit count encode() produces for a given raw bit count k.
+
+        rs_m8 ("shortened" -- see reed_solomon.py's encode() docstring):
+        k no longer has to be an exact multiple of k_bits. It's N full
+        k_bits blocks plus, if there's anything left over, ONE shortened
+        block covering exactly that leftover (never padded up to a full
+        block) -- real_k=leftover/8 symbols in, real_k+nroots symbols
+        (i.e. leftover + 8*nroots bits) out. This is a real bug fix, not
+        a relaxation for its own sake: this exact-multiple requirement is
+        what made Mac(ofdm_kwargs=dict(fec="rs_m8")) derive an unusable
+        8-bit max_segment_bits, and made every non-block-sized message
+        (starting with the bind handshake itself) fail outright -- see
+        docs/mac.md's writeup. ldpc_* (`_BLOCK_BIT_SCHEMES`) is NOT
+        included in this -- still requires an exact multiple, a
+        documented, separate gap (docs/todo.md)."""
+        if self.scheme in _SYMBOL_LEVEL_SCHEMES:
+            n_full_blocks, leftover = divmod(k, self.k_bits)
+            length = n_full_blocks * self.n_bits
+            if leftover > 0:
+                length += leftover + 8 * self._impl.nroots
+            return length
+        if self.scheme in _BLOCK_BIT_SCHEMES:
             if k % self.k_bits != 0:
                 raise ValueError(
                     f"k={k} is not a multiple of {self.scheme}'s block size "
@@ -124,8 +151,19 @@ class FEC(Block):
 
     def decoded_length(self, n: int) -> int:
         """Inverse of encoded_length(): raw bit count decode() produces
-        for a given encoded bit count n."""
-        if self.scheme in _SYMBOL_LEVEL_SCHEMES or self.scheme in _BLOCK_BIT_SCHEMES:
+        for a given encoded bit count n. rs_m8: see encoded_length()'s
+        docstring -- the shortened leftover block (if any) is always
+        strictly smaller than one full block's encoded size, so
+        `n // n_bits` unambiguously recovers the same N full blocks
+        encoded_length() started from; the remainder is exactly that
+        leftover block's own encoded size."""
+        if self.scheme in _SYMBOL_LEVEL_SCHEMES:
+            n_full_blocks, leftover_enc = divmod(n, self.n_bits)
+            length = n_full_blocks * self.k_bits
+            if leftover_enc > 0:
+                length += leftover_enc - 8 * self._impl.nroots
+            return length
+        if self.scheme in _BLOCK_BIT_SCHEMES:
             if n % self.n_bits != 0:
                 raise ValueError(
                     f"n={n} is not a multiple of {self.scheme}'s codeword "
@@ -187,12 +225,83 @@ class FEC(Block):
         blocks = xp.asarray(blocks)
         return blocks.reshape(n_batch, n_blocks * blocks.shape[-1])
 
+    def _encode_symbol_level(self, bits: Any) -> Any:
+        """rs_m8 encode: N full k_bits blocks (existing batched path,
+        unchanged) + at most one shortened leftover block (reed_solomon.py's
+        new shortened-code support, Step 1) -- see encoded_length()'s
+        docstring for why this is split this way, not padded."""
+        xp = self.xp
+        host_bits = self._to_host(bits).astype("uint8")
+        if host_bits.ndim == 1:
+            host_bits = host_bits[None, :]
+        n_batch, total_bits = host_bits.shape
+        n_full_blocks, leftover_bits = divmod(total_bits, self.k_bits)
+        if leftover_bits % 8 != 0:
+            # np.packbits below would otherwise SILENTLY zero-pad this up
+            # to a byte boundary rather than raise -- a real bug caught
+            # here (not by inspection): encode() would succeed, but
+            # decode() has no way to know the true length was 100 bits
+            # and not 104, so the round trip silently comes back wrong,
+            # not loud. Same "fail loud on a genuinely bad shape"
+            # convention this codebase already uses elsewhere (e.g.
+            # Packetizer.encode()'s own CRC byte-alignment check).
+            raise ValueError(
+                f"leftover bit count {leftover_bits} (after {n_full_blocks} full "
+                f"{self.k_bits}-bit blocks) is not a multiple of 8 -- rs_m8 packs "
+                f"whole bytes into symbols, a non-byte-aligned leftover can't be "
+                f"represented"
+            )
+
+        parts = []
+        if n_full_blocks > 0:
+            full_bits = host_bits[:, : n_full_blocks * self.k_bits]
+            symbols, nb, nblk = self._pack_bits_to_symbols(full_bits, self.k_bits)
+            encoded_symbols = self._impl.encode(symbols)
+            parts.append(self._unpack_symbols_to_bits(encoded_symbols, nb, nblk))
+        if leftover_bits > 0:
+            leftover_symbols = np.packbits(host_bits[:, n_full_blocks * self.k_bits :], axis=-1)
+            encoded_leftover = self._impl.encode(leftover_symbols)
+            parts.append(np.unpackbits(encoded_leftover, axis=-1))
+        encoded = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=-1)
+        return xp.asarray(encoded)
+
+    def _decode_symbol_level(self, bits: Any) -> Any:
+        """Inverse of _encode_symbol_level() -- see its docstring."""
+        xp = self.xp
+        host_bits = self._to_host(bits).astype("uint8")
+        if host_bits.ndim == 1:
+            host_bits = host_bits[None, :]
+        n_batch, total_bits = host_bits.shape
+        n_full_blocks, leftover_enc_bits = divmod(total_bits, self.n_bits)
+        if leftover_enc_bits % 8 != 0:
+            # Same real bug as _encode_symbol_level()'s check -- see its
+            # comment. A leftover that's byte-aligned but still too short
+            # to contain a real payload (<= 8*nroots bits, i.e. real_k
+            # would be <= 0) is caught separately, downstream, by
+            # ReedSolomonCode.decode()'s own real_k range check.
+            raise ValueError(
+                f"leftover encoded bit count {leftover_enc_bits} (after "
+                f"{n_full_blocks} full {self.n_bits}-bit blocks) is not a "
+                f"multiple of 8 -- not a genuine rs_m8-encoded stream"
+            )
+
+        parts = []
+        if n_full_blocks > 0:
+            full_bits = host_bits[:, : n_full_blocks * self.n_bits]
+            symbols, nb, nblk = self._pack_bits_to_symbols(full_bits, self.n_bits)
+            decoded_symbols = self._impl.decode(symbols)  # may raise ValueError
+            parts.append(self._unpack_symbols_to_bits(decoded_symbols, nb, nblk))
+        if leftover_enc_bits > 0:
+            leftover_symbols = np.packbits(host_bits[:, n_full_blocks * self.n_bits :], axis=-1)
+            decoded_leftover = self._impl.decode(leftover_symbols)  # may raise ValueError
+            parts.append(np.unpackbits(decoded_leftover, axis=-1))
+        decoded = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=-1)
+        return xp.asarray(decoded)
+
     def encode(self, bits: Any) -> Any:
         xp = self.xp
         if self.scheme in _SYMBOL_LEVEL_SCHEMES:
-            symbols, n_batch, n_blocks = self._pack_bits_to_symbols(bits, self.k_bits)
-            encoded_symbols = self._impl.encode(symbols)
-            return xp.asarray(self._unpack_symbols_to_bits(encoded_symbols, n_batch, n_blocks))
+            return self._encode_symbol_level(bits)
         if self.scheme in _BLOCK_BIT_SCHEMES:
             blocks, n_batch, n_blocks = self._pack_bits_to_blocks(bits, self.k_bits)
             encoded_blocks = self._impl.encode(blocks)
@@ -202,9 +311,7 @@ class FEC(Block):
     def decode(self, bits: Any, **kwargs: Any) -> Any:
         xp = self.xp
         if self.scheme in _SYMBOL_LEVEL_SCHEMES:
-            symbols, n_batch, n_blocks = self._pack_bits_to_symbols(bits, self.n_bits)
-            decoded_symbols = self._impl.decode(symbols)  # may raise ValueError
-            return xp.asarray(self._unpack_symbols_to_bits(decoded_symbols, n_batch, n_blocks))
+            return self._decode_symbol_level(bits)
         if self.scheme in _BLOCK_BIT_SCHEMES:
             blocks, n_batch, n_blocks = self._pack_bits_to_blocks(bits, self.n_bits)
             decoded_blocks = self._impl.decode(blocks, **kwargs)  # may raise ValueError
