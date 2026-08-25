@@ -105,6 +105,23 @@ def run() -> None:
           f"cfo=schmidl_cox, channel_estimator=ls, equalizer=mmse, "
           f"backend=numpy, sdu_bits={SDU_BITS} ===")
 
+    # tx_probe_mac is a throwaway, used ONLY for the "what's being sent"
+    # introspection and the "full TX chain" timing loop below -- neither
+    # of those PDUs is ever forwarded to any receiver. tx_mac/rx_mac
+    # (built separately) stay a clean, PAIRED, contiguous-SN pair used
+    # ONLY for the RX-stage section further down. Keeping these separate
+    # is a real fix, not just tidiness: reusing one Mac for both left
+    # gaps in the SN sequence tx_mac's real receiver (rx_mac) never saw
+    # (every un-forwarded send_iq() call here still bumps the SN
+    # counter), which triggered ReassemblyBuffer's window-eviction logic
+    # to flush multiple pending items in one receive_iq() call (35
+    # delivered from 30 calls, caught by checking n_delivered against
+    # N_ROUNDS directly rather than assuming 1:1).
+    tx_probe_mac = Mac(mode="um", ofdm_kwargs=phy_kwargs)
+    # tx_probe_mac never talks to a real peer (its PDUs are never
+    # forwarded anywhere -- see comment above), so there's no real bind
+    # handshake to run; send_iq() only checks self.bound, set directly.
+    tx_probe_mac.bound = True
     tx_mac = Mac(mode="um", ofdm_kwargs=phy_kwargs)
     rx_mac = Mac(mode="um", ofdm_kwargs=phy_kwargs)
 
@@ -117,36 +134,79 @@ def run() -> None:
     rng = np.random.default_rng(0)
     sdu = rng.integers(0, 2, size=SDU_BITS).astype("uint8")
 
+    # -- what's actually being sent, in real units, not just a timing
+    # number with no context: PDU size, and the OFDM-symbol breakdown of
+    # one frame (derived from the real generated IQ length, not assumed
+    # -- preamble has no CP so isn't samples_per_symbol-sized like the
+    # rest, see Ofdm's own docstring) --
+    ofdm = tx_probe_mac.ofdm
+    pdus = tx_probe_mac._impl.transmit(sdu)
+    samples_per_symbol = ofdm.fft_size + ofdm.cp_len
+    one_frame_iq = ofdm.generate_frame(np.asarray(pdus[0], dtype="uint8")[None, :])
+    total_samples = one_frame_iq.shape[-1]
+    other_symbols = (total_samples - ofdm.fft_size) / samples_per_symbol  # preamble excluded (no CP)
+    payload_symbols = other_symbols - ofdm.n_training_symbols - ofdm.num_symbols_header
+    print(f"\nSDU: {SDU_BITS} bits -> {len(pdus)} PDU(s), {len(pdus[0])} bits/PDU "
+          f"(includes MAC header + FEC/CRC overhead)")
+    print(f"One frame: {total_samples} IQ samples = "
+          f"1 preamble symbol ({ofdm.fft_size} samples, no CP) + "
+          f"{ofdm.n_training_symbols} training + {ofdm.num_symbols_header} header + "
+          f"{payload_symbols:.0f} payload OFDM symbols "
+          f"({samples_per_symbol} samples/symbol each)")
+
     # -- full TX chain: segmentation + FEC/CRC/interleave + modem +
     # resource-grid + IFFT/CP + preamble/training, everything send_iq()
-    # actually does --
+    # actually does -- timed on tx_probe_mac, never forwarded anywhere --
     for _ in range(N_WARMUP):
-        tx_mac.send_iq(sdu)
+        tx_probe_mac.send_iq(sdu)
     start = time.perf_counter()
     for _ in range(N_ROUNDS):
-        iq_frames = tx_mac.send_iq(sdu)
+        probe_iq_frames = tx_probe_mac.send_iq(sdu)
     tx_time = (time.perf_counter() - start) / N_ROUNDS
-    print(f"\nfull TX chain (send_iq(), {len(iq_frames)} PDU(s)/SDU): {tx_time * 1000:.4f} ms")
+    print(f"\nfull TX chain (send_iq(), {len(probe_iq_frames)} PDU(s)/SDU): {tx_time * 1000:.4f} ms")
 
-    # -- individual RX stages, instrumented on the REAL receive_iq() call --
+    # -- individual RX stages, instrumented on the REAL receive_iq() call.
+    # Each round generates a FRESH iq_frames (a real, un-timed send_iq()
+    # call on tx_mac, not instrumented) so rx_mac sees a genuinely new SN
+    # every time -- reusing one fixed iq_frames across every round would
+    # make every call after the first a duplicate-SN reject in
+    # ReassemblyBuffer (mac.receive_iq() correctly returns 0 SDUs for a
+    # repeat -- checked directly before writing this), which would make
+    # "MAC decode" time the cheap duplicate fast-path almost every call
+    # instead of genuine reassembly/delivery work. --
     timings: dict = defaultdict(float)
     _instrument(rx_mac, timings)
     restore_fec_patch = _install_fec_class_patch(timings)
+    n_delivered = 0
+    n_bit_exact = 0
     try:
         for _ in range(N_WARMUP):
-            for iq in iq_frames:
+            for iq in tx_mac.send_iq(sdu):
                 rx_mac.receive_iq(iq)
         timings.clear()  # drop warm-up timing, keep only the timed rounds below
 
         n_calls = 0
         for _ in range(N_ROUNDS):
-            for iq in iq_frames:
-                rx_mac.receive_iq(iq)
+            for iq in tx_mac.send_iq(sdu):
+                delivered = rx_mac.receive_iq(iq)
+                n_delivered += len(delivered)
+                n_bit_exact += sum(np.array_equal(d, sdu) for d in delivered)
                 n_calls += 1
     finally:
         restore_fec_patch()
 
-    print(f"RX stages, per frame decoded (averaged over {n_calls} frames):")
+    print(f"\ndecode check: {n_delivered}/{N_ROUNDS} rounds delivered a SDU, "
+          f"{n_bit_exact}/{n_delivered} of those bit-exact matches of the original "
+          f"({'all correct' if n_bit_exact == N_ROUNDS else 'SOME ROUNDS FAILED -- see below'})")
+    if n_bit_exact != N_ROUNDS:
+        print("  NOTE: a round not delivering doesn't necessarily mean a decode")
+        print("  error -- rx_mac's ReassemblyBuffer is a real, bounded, stateful")
+        print("  window across all rounds (same object reused throughout this")
+        print("  script, matching one real receiver's lifetime), so this can also")
+        print("  reflect its own real give-up/eviction behavior, not just failure.")
+        print("  A delivered-but-NOT-bit-exact SDU, however, IS a real decode bug.")
+
+    print(f"\nRX stages, per frame decoded (averaged over {n_calls} frames):")
     for bucket, label in [
         ("sync+cfo", "sync detect + CFO"),
         ("ofdm_decode", "OFDM decode (FFT+CP strip)"),
