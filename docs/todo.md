@@ -966,3 +966,45 @@ actually plan around). Landed via (see git history on
   the real Jetson target, where core count/topology/thermals (and
   possibly a genuine host-level CPU-affinity guarantee, unlike this
   WSL2 dev machine) are completely different from this laptop.
+
+**2026-08-26 (same day, follow-up): higher-order modulation makes the
+budget problem WORSE, not better -- a real finding from sweeping the
+new `benchmark_x86_stages_v3.py <bits> <modem>` arg (see above) across
+modem schemes at a fixed 10000-bit SDU:**
+
+| modem  | sync+CFO | OFDM decode | Viterbi decode | RS decode | RX vs budget |
+|--------|----------|-------------|-----------------|-----------|--------------|
+| qpsk   | 0.284ms  | 0.070ms     | 0.359ms         | 0.080ms   | 0.73x (1.4x over) |
+| qam16  | 0.141ms  | 0.046ms     | 0.350ms         | 0.082ms   | 0.34x (**3x over**) |
+| qam64  | 0.106ms  | 0.041ms     | 0.353ms         | 0.081ms   | 0.28x (**3.5x over**) |
+
+sync+CFO and OFDM decode shrink with higher-order modulation (fewer
+samples/symbols per frame for the same payload) -- expected. Viterbi and
+RS decode do NOT shrink (flat across all three, ~0.35ms/~0.08ms): they
+cost a function of *coded bit count*, not modulation order, and coded
+bit count doesn't change with how those bits get mapped onto symbols.
+Meanwhile the derived 20-Msps budget itself SHRINKS with higher-order
+modulation (fewer samples -> less time-on-air -> a proportionally
+smaller allowed ms/frame) -- 0.819ms at qpsk down to 0.301ms at qam64
+for the same 10000-bit SDU. So the same fixed FEC cost eats a bigger and
+bigger fraction of a smaller and smaller budget as modulation order goes
+up -- confirmed NOT fixable by sending a bigger payload per frame either
+(coded-bit-count and sample-count both grow ~proportionally with payload
+size at a FIXED modulation order, so the ratio between them stays put;
+only modulation order moves the ratio, and it moves it the wrong way).
+
+This matters because the actual drone-link-demo target scope is QPSK
+**and** 16-QAM, not QPSK alone -- everything benchmarked earlier in
+this section was QPSK-only, the *easier* of the two real modes. QAM16's
+real margin (0.34x, i.e. RX needs ~3x its allotted time) is
+meaningfully worse than QPSK's, and the ~0.43ms combined Viterbi+RS
+floor alone is already close to QAM16's entire per-frame budget before
+sync/FFT/channel-est/MAC are even counted. qam64 was tested only as a
+trend data point -- it is NOT in scope (the requirement stops at
+16-QAM) and does not itself need to hit budget.
+- [ ] Open question, not yet investigated: since QAM16's fixed FEC floor
+  is already ~1x its own budget by itself, closing QAM16's gap
+  specifically may need a genuinely different approach than QPSK's
+  (which still has slack in its non-FEC stages) -- worth treating QAM16,
+  not QPSK, as the primary pass/fail config to benchmark against going
+  forward, since it's the tighter constraint of the two real modes.
