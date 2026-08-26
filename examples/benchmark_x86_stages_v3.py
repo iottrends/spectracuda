@@ -80,6 +80,9 @@ to disable pinning entirely); defaults to core 2.
 
 Usage:
     python examples/benchmark_x86_stages_v3.py
+    python examples/benchmark_x86_stages_v3.py 32000            # override SDU bit count
+    python examples/benchmark_x86_stages_v3.py qam16 32000      # + override modem scheme
+    python examples/benchmark_x86_stages_v3.py 32000 qam16      # order doesn't matter
     SPECTRACUDA_BENCH_PIN_CORE=off python examples/benchmark_x86_stages_v3.py  # to compare
 """
 from __future__ import annotations
@@ -107,10 +110,34 @@ FFT_SIZE = 256
 N_PILOT = 8
 N_DATA = 216
 CP_LEN = 32
-SDU_BITS = int(sys.argv[1]) if len(sys.argv) > 1 else 24000  # pass a bit count as argv[1] to override
 N_ROUNDS = 30
 N_WARMUP = 5
 DEFAULT_PIN_CORE = 2
+_VALID_MODEMS = {"bpsk", "qpsk", "qam16", "qam64", "qam256"}
+
+
+def _parse_args():
+    """Accepts a bit count (e.g. 32000) and/or a modem scheme (e.g.
+    qam16) as positional args, IN EITHER ORDER (`qam16 32000` and
+    `32000 qam16` both work) -- classified by shape (digits -> bit
+    count, else -> modem scheme name), not position, so callers don't
+    need to remember an argument order."""
+    sdu_bits = 24000
+    modem_scheme = "qpsk"
+    for arg in sys.argv[1:]:
+        if arg.isdigit():
+            sdu_bits = int(arg)
+        elif arg.lower() in _VALID_MODEMS:
+            modem_scheme = arg.lower()
+        else:
+            raise SystemExit(
+                f"Unrecognized argument {arg!r} -- expected a bit count (e.g. 32000) "
+                f"or a modem scheme (one of {sorted(_VALID_MODEMS)})"
+            )
+    return sdu_bits, modem_scheme
+
+
+SDU_BITS, MODEM_SCHEME = _parse_args()
 
 
 def _pin_to_one_core() -> str:
@@ -211,7 +238,7 @@ def run() -> None:
     pin_status = _pin_to_one_core()
     phy_kwargs = dict(
         fft_size=FFT_SIZE, n_pilot=N_PILOT, n_data=N_DATA, cp_len=CP_LEN,
-        modem="qpsk", fec="rs_m8", fec1="conv_v27", crc="crc16",
+        modem=MODEM_SCHEME, fec="rs_m8", fec1="conv_v27", crc="crc16",
         sync="schmidl_cox", cfo="schmidl_cox",
         channel_estimator="ls", equalizer="mmse",
         backend="numpy",
@@ -219,7 +246,7 @@ def run() -> None:
     print(f"=== v3 (stopwatch-timed stage breakdown -- spectracuda's own transparent "
           f"native/Numba acceleration, whatever's actually active on THIS machine) config: "
           f"fft_size={FFT_SIZE}, n_pilot={N_PILOT}, n_data={N_DATA}, cp_len={CP_LEN}, "
-          f"modem=qpsk, fec='rs_m8' (inner), fec1='conv_v27' (outer), crc=crc16, "
+          f"modem={MODEM_SCHEME}, fec='rs_m8' (inner), fec1='conv_v27' (outer), crc=crc16, "
           f"sync=schmidl_cox, cfo=schmidl_cox, channel_estimator=ls, equalizer=mmse, "
           f"backend=numpy, sdu_bits={SDU_BITS} ===")
     print(f"    native FEC backend (Viterbi/RS, C, transparent, fec/_native.py): "
