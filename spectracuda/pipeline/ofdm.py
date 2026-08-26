@@ -662,13 +662,28 @@ class Ofdm(Block):
             raw_bit_count, self.modem.scheme, self.fec, user_data, n_batch, self.crc, self.fec1
         )
 
+        # Batched across payload symbols in ONE call each, not a Python loop
+        # per symbol: modem.modulate()/grid.scatter()/mod.process() all
+        # already accept an arbitrary leading batch dimension (their own
+        # batch-shape contracts, docs/architecture.md), so folding
+        # (n_batch, n_payload_symbols) into one combined axis and calling
+        # each once lets numpy's own vectorized C loop (ifft's axis=-1 in
+        # particular) do the repetition instead of paying Python-level
+        # call overhead ~n_payload_symbols times per frame -- a real,
+        # measured bottleneck (examples/benchmark_x86_stages_v2.py profiling
+        # found this loop as the single largest remaining tx cost once FEC
+        # encode was fixed). Reshape order is batch-major/symbol-minor
+        # throughout (grouped_bits' own axis order), so this produces the
+        # exact same per-batch-item symbol sequence the old per-symbol loop
+        # did, just without the loop.
         grouped_bits = modulated_bits.reshape(n_batch, n_payload_symbols, self.bits_per_ofdm_symbol)
-        payload_chunks = []
-        for i in range(n_payload_symbols):
-            data_symbols = self.modem.modulate(grouped_bits[:, i, :])
-            freq = self.grid.scatter(xp, pilots_batch, data_symbols)
-            payload_chunks.append(self.mod.process(freq))
-        payload_time = xp.concatenate(payload_chunks, axis=-1)
+        combined_bits = grouped_bits.reshape(n_batch * n_payload_symbols, self.bits_per_ofdm_symbol)
+        pilots_combined = xp.tile(self.pilot_values, (n_batch * n_payload_symbols, 1))
+        data_symbols_all = self.modem.modulate(combined_bits)
+        freq_all = self.grid.scatter(xp, pilots_combined, data_symbols_all)
+        payload_time_all = self.mod.process(freq_all)  # (n_batch*n_payload_symbols, fft_size+cp_len)
+        symbol_len = self.fft_size + self.cp_len
+        payload_time = payload_time_all.reshape(n_batch, n_payload_symbols * symbol_len)
 
         frame = xp.concatenate([preamble_batch, train_batch, header_batch, payload_time], axis=-1)
         return self._quantize(frame)  # simulate the DAC's resolution -- see class docstring
@@ -892,23 +907,68 @@ class Ofdm(Block):
         other half of rx_process(), extracted for the same reuse reason
         as _decode_header_from_sync() above. Returns bits, crc_valid, evm."""
         xp = self.xp
-        equalized_chunks = []
-        payload_bits_chunks = []
-        for _ in range(n_payload_symbols):
-            payload_slot = self._extract_slot(rx_corrected, pos, self.slot_len)
-            pos = pos + self.slot_len
-            payload_rx_grid = self.demod.process(payload_slot)
-            payload_rx_data = self.grid.extract_data(xp, payload_rx_grid)
-            equalized = self.equalizer.process(payload_rx_data, channel_est=h_hat_data)
-            equalized_chunks.append(equalized)
-            payload_bits_chunks.append(payload_modem.demodulate(equalized))
-        encoded_bits = xp.concatenate(payload_bits_chunks, axis=-1)
+        n_batch = rx_corrected.shape[0]
+
+        # Batched across payload symbols in ONE call each, not a Python loop
+        # per symbol -- the tx-side mirror of this fix (generate_frame()'s
+        # own module comment has the full rationale: modem/grid/demod/
+        # equalizer all already accept an arbitrary leading batch dim, so
+        # folding (n_batch, n_payload_symbols) into one combined axis lets
+        # numpy's own vectorized C loop do the repetition instead of paying
+        # Python-level call overhead ~n_payload_symbols times per frame).
+        #
+        # Slot gathering: pos[b] is a genuinely per-item sync offset, but
+        # the SPACING between consecutive symbols (self.slot_len) is the
+        # same for every item -- so every (item, symbol) slot start is
+        # pos[b] + i*self.slot_len, computable by broadcasting (no data
+        # dependency across symbols), then gathered in one fancy-indexing
+        # call rather than n_payload_symbols separate _extract_slot() calls.
+        symbol_starts = pos[:, None] + xp.arange(n_payload_symbols)[None, :] * self.slot_len  # (n_batch, n_payload_symbols)
+        sample_idx = symbol_starts[:, :, None] + xp.arange(self.slot_len)[None, None, :]  # (n_batch, n_payload_symbols, slot_len)
+        # Explicit bounds check, matching _extract_slot()'s OLD per-symbol
+        # basic-slice behavior: a plain `rx[b, s:s+slot_len]` on a
+        # corrupted/truncated buffer silently clips to a shorter array,
+        # which then failed downstream as a ValueError (broadcasting that
+        # short slice into a fixed-size row) -- caught by
+        # mac/session.py's `except (ValueError, NotImplementedError)`.
+        # Advanced (fancy) indexing has no such silent-clip behavior -- it
+        # raises IndexError, which that except clause does NOT catch -- so
+        # this checks explicitly and raises the SAME exception type the
+        # rest of this pipeline already uses for "corrupted/implausible
+        # input", rather than letting a new, uncaught exception type leak
+        # out of what used to be a handled failure mode (real regression
+        # caught by tests/test_mac_session.py::
+        # test_am_recovers_from_channel_loss_that_defeats_um, not assumed).
+        if sample_idx.size and int(sample_idx.max()) >= rx_corrected.shape[1]:
+            raise ValueError(
+                f"payload extraction needs samples up to index {int(sample_idx.max())} "
+                f"but rx_corrected only has {rx_corrected.shape[1]} -- likely a "
+                f"corrupted/truncated frame (insufficient samples for "
+                f"{n_payload_symbols} payload symbols)"
+            )
+        batch_idx = xp.arange(n_batch)[:, None, None]
+        all_slots = rx_corrected[batch_idx, sample_idx]  # (n_batch, n_payload_symbols, slot_len)
+
+        combined_slots = all_slots.reshape(n_batch * n_payload_symbols, self.slot_len)
+        combined_rx_grid = self.demod.process(combined_slots)
+        combined_rx_data = self.grid.extract_data(xp, combined_rx_grid)
+        h_hat_combined = xp.repeat(h_hat_data, n_payload_symbols, axis=0)  # batch-major/symbol-minor, matches combined_slots' own row order
+        equalized_combined = self.equalizer.process(combined_rx_data, channel_est=h_hat_combined)
+        demod_bits_combined = payload_modem.demodulate(equalized_combined)  # (n_batch*n_payload_symbols, bits_per_symbol_payload) -- UNTRUNCATED
+
+        n_data = equalized_combined.shape[-1]
+        bits_per_symbol_payload = demod_bits_combined.shape[-1]
+        equalized_flat = equalized_combined.reshape(n_batch, n_payload_symbols * n_data)
+        encoded_bits = demod_bits_combined.reshape(n_batch, n_payload_symbols * bits_per_symbol_payload)
 
         # Discard any automatic partial-last-symbol padding (see
         # generate_frame()'s docstring/docs/todo.md #1.10) -- the last
         # symbol may carry filler bits beyond encoded_bit_count, which
         # would otherwise be fed into FEC-decode as if they were real
-        # codeword bits.
+        # codeword bits. (EVM below deliberately uses the UNTRUNCATED
+        # demod_bits_combined/equalized_combined, matching the original
+        # per-symbol-chunk behavior -- the last symbol's filler bits are
+        # still real, meaningful EVM data, just not real FEC codeword bits.)
         encoded_bits = encoded_bits[:, :encoded_bit_count]
 
         # FEC-decode then CRC-strip+check, delegated to payload_packetizer
@@ -925,8 +985,9 @@ class Ofdm(Block):
         # EVM: standard normalized RMS EVM against the receiver's OWN
         # hard-decision re-modulated symbols (no ground truth needed --
         # see framing/stats.py's module docstring).
-        ideal_chunks = [payload_modem.modulate(b) for b in payload_bits_chunks]
-        evm = compute_evm(xp, xp.concatenate(equalized_chunks, axis=-1), xp.concatenate(ideal_chunks, axis=-1))
+        ideal_combined = payload_modem.modulate(demod_bits_combined)
+        ideal_flat = ideal_combined.reshape(n_batch, n_payload_symbols * n_data)
+        evm = compute_evm(xp, equalized_flat, ideal_flat)
 
         return {"bits": raw_bits, "crc_valid": crc_valid, "evm": evm}
 
