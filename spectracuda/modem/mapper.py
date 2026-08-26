@@ -56,6 +56,18 @@ class Modem(Block):
             f"(n_batch, n_bits // {self.bits_per_symbol}) complex64 out, "
             f"and the exact inverse for demodulate()"
         )
+        # Precomputed once here, not on every modulate()/demodulate() call:
+        # `half` (bits per I/Q axis) and therefore these weight/shift arrays
+        # are fixed for this instance's whole lifetime. Re-deriving them
+        # per call (per-symbol-batch, i.e. every OFDM symbol) was a real,
+        # measured cost -- np.arange()+shift-table construction running on
+        # the hot TX/RX path for no reason, since nothing in it ever
+        # changes after __init__.
+        half = 1 if scheme == "bpsk" else self.bits_per_symbol // 2
+        xp = self.xp
+        self._weights_half = 1 << xp.arange(half - 1, -1, -1, dtype="int64")
+        self._shifts_half = xp.arange(half - 1, -1, -1, dtype="int64")
+        self._norm = self._compute_norm_factor()
 
     # -- internal helpers ---------------------------------------------------
 
@@ -72,17 +84,18 @@ class Modem(Block):
         return b ^ (b >> 1)
 
     def _bits_to_int(self, bits):
-        """Pack MSB-first bits along the last axis into integers."""
-        xp = self.xp
-        nbits = bits.shape[-1]
-        weights = 1 << xp.arange(nbits - 1, -1, -1, dtype="int64")
-        return (bits.astype("int64") * weights).sum(axis=-1)
+        """Pack MSB-first bits along the last axis into integers. `bits`
+        is always `half`-wide here (this instance's fixed I/Q axis width),
+        so the weight table is the precomputed `self._weights_half`, not
+        rebuilt per call."""
+        return (bits.astype("int64") * self._weights_half).sum(axis=-1)
 
     def _int_to_bits(self, ints, nbits: int):
-        """Unpack integers into MSB-first bits along a new last axis."""
-        xp = self.xp
-        shifts = xp.arange(nbits - 1, -1, -1, dtype="int64")
-        return ((ints[..., None] >> shifts) & 1).astype("uint8")
+        """Unpack integers into MSB-first bits along a new last axis.
+        `nbits` is always this instance's fixed `half`, so the shift
+        table is the precomputed `self._shifts_half`, not rebuilt per
+        call."""
+        return ((ints[..., None] >> self._shifts_half) & 1).astype("uint8")
 
     def _pam_level(self, binary_idx, nbits: int):
         """Natural-binary index (0..2**nbits-1) -> symmetric odd PAM level
@@ -94,7 +107,7 @@ class Modem(Block):
         the double-precision cost for nothing)."""
         return 2 * binary_idx.astype("float32") - (2 ** nbits - 1)
 
-    def _norm_factor(self) -> float:
+    def _compute_norm_factor(self) -> float:
         """Average-symbol-power normalization (matches the well-known
         IEEE 802.11-style constants: 1, 1/sqrt(2), 1/sqrt(10), 1/sqrt(42),
         1/sqrt(170) for bpsk/qpsk/16/64/256-QAM respectively)."""
@@ -117,7 +130,7 @@ class Modem(Block):
             )
         n_symbols = bits.shape[-1] // self.bits_per_symbol
         grouped = bits.reshape(bits.shape[0], n_symbols, self.bits_per_symbol)
-        norm = self._norm_factor()
+        norm = self._norm
 
         if self.scheme == "bpsk":
             b = grouped[..., 0]
@@ -137,7 +150,7 @@ class Modem(Block):
         """Hard-decision demodulation (nearest constellation point)."""
         xp = self.xp
         symbols = xp.asarray(symbols)
-        norm = self._norm_factor()
+        norm = self._norm
         descaled = symbols / norm
 
         if self.scheme == "bpsk":

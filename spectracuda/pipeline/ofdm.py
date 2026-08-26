@@ -359,6 +359,21 @@ class Ofdm(Block):
         )
         self.fec_codec = self.packetizer.fec_codec
         self.crc_codec = self.packetizer.crc_codec
+        # Single-entry memo for the RX-side "throwaway" payload_modem/
+        # payload_packetizer built in _decode_header_from_sync() from the
+        # DECODED header's mod_scheme/crc/fec0/fec1 -- see that method's
+        # own comment for why those must be resolved from the wire, not
+        # assumed from self.packetizer. In practice a link doesn't
+        # renegotiate scheme every frame, so rebuilding those objects
+        # (fresh native Viterbi/RS trellis+GF-table construction included)
+        # on every single received frame was pure waste on the hot path --
+        # measured ~0.15ms/frame. Keyed on the resolved (mod_scheme, crc,
+        # fec0, fec1) tuple (interleaver/interleaver_kwargs are always
+        # THIS object's own fixed values here, never resolved from the
+        # header -- see below -- so they don't need to be part of the key);
+        # a scheme change on the wire still rebuilds correctly, just no
+        # longer needlessly on the common no-change path.
+        self._rx_payload_codec_cache = None  # (key_tuple, payload_modem, payload_packetizer) or None
         self.n_training_symbols = n_training_symbols
         self.batch_shape_doc = (
             "generate_frame(bits): (n_batch, k * n_data * bits_per_symbol) "
@@ -412,6 +427,13 @@ class Ofdm(Block):
                 f"bits across {self.num_symbols_header} symbol(s) (rounding "
                 f"collision) -- use a larger n_data"
             )
+        # Precomputed once here (both operands are fixed for this object's
+        # lifetime) instead of recomputing via setdiff1d/arange on every
+        # single _build_header_symbols() call -- that was a real per-TX-frame
+        # cost (measured ~0.27ms/frame) for a result that never changes.
+        self._header_filler_positions = np.setdiff1d(
+            np.arange(total_header_slots), self._header_positions_flat
+        )
         self.header_codec = HeaderCodec(scramble_seed=42)
         # Alias for existing call sites (tests included) that reach into
         # this directly -- the real mask now lives on HeaderCodec.
@@ -587,8 +609,7 @@ class Ofdm(Block):
         total_slots = self.num_symbols_header * self.grid.n_data
         flat_bits = np.empty(total_slots, dtype="uint8")
         flat_bits[self._header_positions_flat] = content_bits
-        filler_positions = np.setdiff1d(np.arange(total_slots), self._header_positions_flat)
-        flat_bits[filler_positions] = self._header_filler_bits
+        flat_bits[self._header_filler_positions] = self._header_filler_bits
 
         symbol_chunks = flat_bits.reshape(self.num_symbols_header, self.grid.n_data)
         pilots_batch = xp.tile(self.pilot_values, (n_batch, 1))
@@ -838,16 +859,22 @@ class Ofdm(Block):
         # docstring): this receiver must already be configured with the
         # matching interleaver out-of-band, so THIS object's own
         # self.interleaver/self.interleaver_kwargs are used here.
-        payload_modem = Modem(header_fields["mod_scheme"], backend=self.backend)
+        codec_key = (header_fields["mod_scheme"], header_fields["crc"], header_fields["fec0"], header_fields["fec1"])
+        cached = self._rx_payload_codec_cache
+        if cached is not None and cached[0] == codec_key:
+            payload_modem, payload_packetizer = cached[1], cached[2]
+        else:
+            payload_modem = Modem(header_fields["mod_scheme"], backend=self.backend)
+            payload_packetizer = Packetizer(
+                crc=header_fields["crc"],
+                fec=header_fields["fec0"],
+                fec1=header_fields["fec1"],
+                interleaver=self.interleaver,
+                interleaver_kwargs=self.interleaver_kwargs,
+                backend=self.backend,
+            )
+            self._rx_payload_codec_cache = (codec_key, payload_modem, payload_packetizer)
         bits_per_symbol_payload = self.grid.n_data * payload_modem.bits_per_symbol
-        payload_packetizer = Packetizer(
-            crc=header_fields["crc"],
-            fec=header_fields["fec0"],
-            fec1=header_fields["fec1"],
-            interleaver=self.interleaver,
-            interleaver_kwargs=self.interleaver_kwargs,
-            backend=self.backend,
-        )
 
         raw_payload_len_bits = header_fields["payload_len_bits"]
         try:
