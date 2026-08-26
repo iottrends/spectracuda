@@ -16,6 +16,12 @@ venv/
 # "reference, not shipped" status as liquid-dsp above.
 /reference/libcorrect/
 
+# Cloned to study cuPHY's real, hand-fused CUDA LDPC kernels (NVIDIA
+# Aerial CUDA-Accelerated RAN) as a reference for a smaller, purpose-
+# built LDPC kernel sized to this project's own real batch sizes --
+# same "reference, not shipped" status as liquid-dsp/libcorrect above.
+/reference/aerial-cuda-accelerated-ran/
+
 # Sphinx build output (spectracuda.readthedocs.io builds this itself) --
 # regenerate locally with `.venv/bin/python -m sphinx -b html docs docs/_build/html`.
 /docs/_build/
