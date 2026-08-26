@@ -27,9 +27,20 @@ docs = ["matplotlib>=3.8", "sphinx>=7.0", "myst-parser>=2.0", "sphinx-rtd-theme>
 # pyzmq is dev/example-only, used by examples/drone_ground_unit.py and
 # drone_air_unit.py's IQ transport -- never imported by spectracuda itself.
 examples = ["pyzmq>=25.0"]
+# Optional CRC acceleration (fec/_numba_crc.py) -- silently unused if not
+# installed (see that module's own docstring); NOT required for the
+# native FEC (Viterbi/RS) acceleration in fec/_native.py, which compiles
+# its own vendored C source instead of depending on a Python package.
+fast = ["numba>=0.58"]
 
 [tool.setuptools.packages.find]
 include = ["spectracuda*"]
+
+[tool.setuptools.package-data]
+# Vendored libcorrect C source (fec/_native.py) -- must ship as package
+# data so an installed wheel (not just an editable/dev checkout) can
+# still compile the native FEC backend on first use.
+spectracuda = ["fec/_native_src/libcorrect/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

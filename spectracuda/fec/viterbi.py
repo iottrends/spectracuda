@@ -40,6 +40,7 @@ from typing import Any
 import numpy as np
 
 from ..block import Block
+from ._native import NativeConvolutional, native_available
 
 _K = 7
 _G1 = 0o171  # NASA/CCSDS standard rate-1/2 K=7 generator polynomials
@@ -70,6 +71,30 @@ class ConvolutionalCode(Block):
             "decode: (n_batch, 2*(k+6)) bits -> (n_batch, k) bits "
             "(hard-decision Viterbi)"
         )
+
+        # Transparent native-code acceleration (see fec/_native.py's own
+        # module docstring for the full rationale/measurements) -- CPU-
+        # only, so only ever attempted for backend="numpy"; backend=
+        # "cupy" always uses the array-vectorized path below regardless
+        # of whether the native backend happens to be available, since
+        # routing cupy arrays through it would mean a device->host->
+        # device round trip on every call, defeating the point of
+        # choosing cupy.
+        #
+        # A real libcorrect decode() bug lived here until fixed --
+        # correct_convolutional_decode() withholds up to ~13 bits at the
+        # end of every decode, contrary to its own documented contract
+        # (see NativeConvolutional._decode_one's own docstring in
+        # fec/_native.py for the full story and the fix: padding the
+        # DECODE-side input with synthetic zero-state trellis steps,
+        # which does NOT change the encoded bit length/wire format).
+        # This was found via this project's own full test suite (16
+        # failures) after an earlier promotion attempt trusted a
+        # narrower check (one message size) that never happened to
+        # trigger it -- re-verified across 210 message sizes (every
+        # T-mod-8 residue) plus real bit-error injection against the
+        # pure-Python path as ground truth before re-enabling here.
+        self._native = NativeConvolutional() if (self.backend == "numpy" and native_available()) else None
 
         # Forward transition table (plain numpy -- tiny, built once,
         # independent of backend): for each of the 64 states and each
@@ -113,6 +138,8 @@ class ConvolutionalCode(Block):
         bits = xp.asarray(bits)
         if bits.ndim == 1:
             bits = bits[None, :]
+        if self._native is not None:
+            return xp.asarray(self._native.encode(bits))
         n_batch = bits.shape[0]
         tail = xp.zeros((n_batch, self.tail_bits), dtype=bits.dtype)
         padded = xp.concatenate([bits, tail], axis=-1)  # (n_batch, k+tail)
@@ -138,6 +165,8 @@ class ConvolutionalCode(Block):
         bits = xp.asarray(bits)
         if bits.ndim == 1:
             bits = bits[None, :]
+        if self._native is not None:
+            return xp.asarray(self._native.decode(bits))
         n_batch = bits.shape[0]
         T = bits.shape[-1] // 2
         r1 = bits[:, 0::2].astype("float32")

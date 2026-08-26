@@ -69,6 +69,7 @@ from typing import Any
 import numpy as np
 
 from ..block import Block
+from ._numba_crc import numba_available, numba_generate_key
 
 _REG_MASK = np.uint64(0xFFFFFFFF)
 
@@ -170,6 +171,19 @@ class CRC(Block):
 
         table = _TABLES[self.scheme]
         width_mask = _WIDTH_MASK[self.scheme]
+
+        # Transparent Numba-JIT acceleration (see fec/_numba_crc.py's
+        # own module docstring -- measured ~1100x on this exact loop).
+        # msg is already host numpy at this point regardless of
+        # self.backend (_to_host_bytes() above), so this is safe/
+        # beneficial for both backend="numpy" and backend="cupy"
+        # instances alike -- unlike fec/_native.py's FEC codecs, there's
+        # no cupy-array round-trip concern to gate on here. Same silent-
+        # fallback contract as _native.py: a missing/failed numba import
+        # falls back to the plain-Python loop below with no error.
+        if numba_available():
+            return numba_generate_key(self.scheme, msg, table, _REG_MASK, width_mask)
+
         key = np.full(n_batch, _REG_MASK, dtype=np.uint64)
         n = msg.shape[1]
         for i in range(n):

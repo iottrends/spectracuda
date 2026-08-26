@@ -99,6 +99,7 @@ from typing import Any
 import numpy as np
 
 from ..block import Block
+from ._native import NativeReedSolomon, native_available
 
 _GF_POLY = 0x11D  # standard GF(256) primitive polynomial (CCSDS/QR-code convention)
 _N = 255
@@ -171,6 +172,11 @@ class ReedSolomonCode(Block):
             f"{_NROOTS // 2} symbol errors per codeword); real_k = {_N} is "
             f"the original full-length behavior, unchanged."
         )
+        # Transparent native-code acceleration -- see fec/_native.py's
+        # own module docstring (same rationale as ConvolutionalCode's
+        # identical attribute; RS's Berlekamp-Massey inner loop is the
+        # bigger win of the two, ~130x measured on the worst case)."""
+        self._native = NativeReedSolomon() if (self.backend == "numpy" and native_available()) else None
 
     def _encode_one(self, msg_row: np.ndarray) -> np.ndarray:
         """Systematic encoding via a shift-register polynomial division
@@ -200,6 +206,8 @@ class ReedSolomonCode(Block):
         real_k = host_msg.shape[-1]
         if not (1 <= real_k <= _K):
             raise ValueError(f"expected 1..{_K} message symbols, got {real_k}")
+        if self._native is not None:
+            return xp.asarray(self._native.encode(host_msg))
         n_batch = host_msg.shape[0]
         if real_k < _K:
             pad = np.zeros((n_batch, _K - real_k), dtype="uint8")
@@ -340,6 +348,8 @@ class ReedSolomonCode(Block):
                 f"expected {1 + _NROOTS}..{_N} codeword symbols (real_k + "
                 f"{_NROOTS} for 1 <= real_k <= {_K}), got {host_codeword.shape[-1]}"
             )
+        if self._native is not None:
+            return xp.asarray(self._native.decode(host_codeword))
         n_batch = host_codeword.shape[0]
         if real_k < _K:
             pad = np.zeros((n_batch, _K - real_k), dtype="uint8")
