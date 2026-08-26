@@ -1,4 +1,5 @@
-"""v3 of benchmark_x86_stages_v2.py: NO monkey-patching, anywhere.
+"""v3 of benchmark_x86_stages_v2.py, revised: stopwatch-timed stage
+breakdown, not cProfile-timed.
 
 v1 patched in a standalone Numba prototype (before Numba/native accel was
 promoted into the library). v2 patched in a SEPARATE, hand-rolled
@@ -15,42 +16,70 @@ That fix lives INSIDE spectracuda now, and activation is, by design,
 "FULLY AUTOMATIC and TRANSPARENT, not a new constructor argument or config
 flag" (fec/_native.py's own module docstring) -- same story for CRC's
 Numba path (fec/crc.py's generate_key() calls numba_generate_key()
-directly if available). So this version needs zero patches to exercise
-either: Mac(mode=..., ofdm_kwargs=...) is built completely normally, and
-whichever backend is actually active on this machine (native C, Numba,
-or the pure-Python fallback if neither compiled) is exactly what
-send_iq()/receive_iq() use, with nothing swapped in from outside.
+directly if available). Mac(mode=..., ofdm_kwargs=...) is built completely
+normally, and whichever backend is actually active on this machine
+(native C, Numba, or the pure-Python fallback if neither compiled) is
+exactly what send_iq()/receive_iq() use.
 
-Per-stage breakdown, without patching, comes from Python's own
-cProfile/pstats reading the REAL call graph instead of wrapping methods:
-ConvolutionalCode.decode and ReedSolomonCode.decode are simply different
-functions in different files, so their own cumulative time is directly
-attributable with no self.scheme bookkeeping needed (unlike v1/v2's
-FEC.decode-level patch, which had to dispatch on self.scheme by hand to
-tell fec0/fec1 apart). Cumulative time correctly includes whatever that
-function calls internally -- a pure-Python loop, or a ctypes call into
-native C -- cProfile times wall-clock between a function's own call/
-return regardless of what runs underneath it.
+This revision's own history: the ORIGINAL v3 got its per-stage breakdown
+from cProfile/pstats reading the real call graph, specifically to avoid
+having to patch anything (unlike v1/v2). That turned out to be a real
+mistake, found by direct investigation (not assumed): cProfile's own
+instrumentation overhead scales with the SIZE of the whole call graph
+being traced (it hooks every function call/return in the process while
+active, not just the ones a caller cares about), and that overhead does
+NOT distribute evenly across stages -- it disproportionately inflates
+stages built from many small nested calls. Reed-Solomon decode (~21 small
+Python-level calls per frame: pack/unpack + a per-block ctypes call each)
+was measured at ~3x its real cost under cProfile precisely because of
+this, while Viterbi decode (1 big call per frame) was barely affected.
+Verified conclusively: a plain time.perf_counter() stopwatch wrapped
+directly around the SAME real calls in the SAME real pipeline (no
+cProfile at all) consistently agreed with an isolated, out-of-pipeline
+timing of the identical call -- cProfile alone was the outlier.
+
+So this version DOES monkey-patch now (see _install_timing_patch()) --
+but only to wrap each real method with a stopwatch, never to swap in a
+different implementation (contrast with v1/v2's patches, which replaced
+ConvolutionalCode/ReedSolomonCode's methods with a separate, non-
+production binding). Whatever backend is really active (native C, Numba,
+pure-Python fallback) still runs completely unchanged underneath every
+wrapped call -- this changes how the number is MEASURED, not what code
+runs. A stopwatch wrapper's own overhead (one timer read before the
+call, one after, a dict increment) is orders of magnitude smaller than
+cProfile's per-call-graph-wide hook, and critically does not compound
+with how deep or wide the REST of the pipeline's call graph is -- which
+is exactly the property that made cProfile's numbers untrustworthy here.
 
 The headline TX/RX timing numbers are still measured on a plain,
-UNPROFILED pass (cProfile's own per-call overhead is real and would
-otherwise inflate them) -- the profiled pass, run separately over the
-same real inputs, is used only for the stage-breakdown proportions.
+UNINSTRUMENTED pass (nothing patched at all) -- the stopwatch-instrumented
+pass, run separately over the same real inputs, is used only for the
+stage-breakdown proportions, and is reconciled against that pristine
+headline total (see "everything else" below) rather than trusted as a
+total in its own right.
 
 Usage:
     python examples/benchmark_x86_stages_v3.py
 """
 from __future__ import annotations
 
-import cProfile
-import pstats
 import sys
 import time
+from collections import defaultdict
 
 import numpy as np
 
+from spectracuda.cfo.schmidl_cox import SchmidlCoxCFO
+from spectracuda.channel.ls import LSChannelEstimator
+from spectracuda.equalizer.mmse import MMSEEqualizer
 from spectracuda.fec import _native, _numba_crc
+from spectracuda.fec.crc import CRC
+from spectracuda.fec.reed_solomon import ReedSolomonCode
+from spectracuda.fec.viterbi import ConvolutionalCode
 from spectracuda.mac import Mac
+from spectracuda.mac.um import UmEntity
+from spectracuda.ofdm.fft import OfdmDemodulator
+from spectracuda.sync.schmidl_cox import SchmidlCoxSync
 
 FFT_SIZE = 256
 N_PILOT = 8
@@ -61,22 +90,71 @@ N_ROUNDS = 30
 N_WARMUP = 5
 
 
-def _cumulative_time(stats: pstats.Stats, funcname: str, filename_suffix: str) -> float:
-    """Sum of cumulative time (ct), across every call recorded in this one
-    profiling pass, for the function named `funcname` defined in a file
-    ending in `filename_suffix` -- e.g. ("decode", "viterbi.py") finds
-    ConvolutionalCode.decode's own total time, wherever it actually did
-    the work (a pure-Python loop, or a call down into the native/Numba
-    backend -- either way it's real elapsed time under this function's
-    own call/return, cProfile doesn't care what's underneath). Matching
-    by (funcname, filename suffix) rather than by object identity is what
-    lets this run with ZERO patching: nothing needs to be swapped in to
-    observe which real function spent the time."""
-    total = 0.0
-    for (filename, _lineno, fname), (_cc, _nc, _tt, ct, _callers) in stats.stats.items():
-        if fname == funcname and filename.endswith(filename_suffix):
-            total += ct
-    return total
+def _timed(fn, bucket: str, timings: dict):
+    """Wrap an existing (unbound) method with a plain stopwatch that
+    accumulates elapsed wall-clock time into timings[bucket] -- the
+    SAME technique examples/benchmark_x86_stages_v2.py used, but applied
+    here to spectracuda's own real methods (never a swapped-in
+    implementation) purely to time them. See module docstring for why
+    this replaced cProfile."""
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = fn(*args, **kwargs)
+        timings[bucket] += time.perf_counter() - start
+        return result
+
+    return wrapper
+
+
+def _install_timing_patch(timings: dict):
+    """Monkey-patches the REAL classes' REAL methods (not a different
+    binding -- see module docstring) with _timed() stopwatch wrappers,
+    covering both TX-side (encode) and RX-side (decode) stages so one
+    installer serves both stage-breakdown passes below. Returns a
+    restore() callable that puts every original method back -- always
+    call it in a finally: block, even if send_iq()/receive_iq() raises,
+    so a failed run never leaves the patch installed for anything after
+    it (including, critically, the pristine unpatched headline passes
+    this script also runs)."""
+    orig = dict(
+        conv_encode=ConvolutionalCode.encode, conv_decode=ConvolutionalCode.decode,
+        rs_encode=ReedSolomonCode.encode, rs_decode=ReedSolomonCode.decode,
+        crc_generate=CRC.generate_key,
+        sync_process=SchmidlCoxSync.process,
+        cfo_process=SchmidlCoxCFO.process, cfo_correct=SchmidlCoxCFO.correct,
+        ofdm_demod_process=OfdmDemodulator.process,
+        ls_process=LSChannelEstimator.process,
+        mmse_process=MMSEEqualizer.process,
+        um_receive=UmEntity.receive,
+    )
+    ConvolutionalCode.encode = _timed(orig["conv_encode"], "conv_encode", timings)
+    ConvolutionalCode.decode = _timed(orig["conv_decode"], "conv_decode", timings)
+    ReedSolomonCode.encode = _timed(orig["rs_encode"], "rs_encode", timings)
+    ReedSolomonCode.decode = _timed(orig["rs_decode"], "rs_decode", timings)
+    CRC.generate_key = _timed(orig["crc_generate"], "crc_generate", timings)
+    SchmidlCoxSync.process = _timed(orig["sync_process"], "sync_cfo", timings)
+    SchmidlCoxCFO.process = _timed(orig["cfo_process"], "sync_cfo", timings)
+    SchmidlCoxCFO.correct = _timed(orig["cfo_correct"], "sync_cfo", timings)
+    OfdmDemodulator.process = _timed(orig["ofdm_demod_process"], "ofdm_decode", timings)
+    LSChannelEstimator.process = _timed(orig["ls_process"], "chanest_eq", timings)
+    MMSEEqualizer.process = _timed(orig["mmse_process"], "chanest_eq", timings)
+    UmEntity.receive = _timed(orig["um_receive"], "mac_decode", timings)
+
+    def restore():
+        ConvolutionalCode.encode = orig["conv_encode"]
+        ConvolutionalCode.decode = orig["conv_decode"]
+        ReedSolomonCode.encode = orig["rs_encode"]
+        ReedSolomonCode.decode = orig["rs_decode"]
+        CRC.generate_key = orig["crc_generate"]
+        SchmidlCoxSync.process = orig["sync_process"]
+        SchmidlCoxCFO.process = orig["cfo_process"]
+        SchmidlCoxCFO.correct = orig["cfo_correct"]
+        OfdmDemodulator.process = orig["ofdm_demod_process"]
+        LSChannelEstimator.process = orig["ls_process"]
+        MMSEEqualizer.process = orig["mmse_process"]
+        UmEntity.receive = orig["um_receive"]
+
+    return restore
 
 
 def run() -> None:
@@ -87,8 +165,8 @@ def run() -> None:
         channel_estimator="ls", equalizer="mmse",
         backend="numpy",
     )
-    print(f"=== v3 (no monkey-patches -- spectracuda's own transparent native/Numba "
-          f"acceleration, whatever's actually active on THIS machine) config: "
+    print(f"=== v3 (stopwatch-timed stage breakdown -- spectracuda's own transparent "
+          f"native/Numba acceleration, whatever's actually active on THIS machine) config: "
           f"fft_size={FFT_SIZE}, n_pilot={N_PILOT}, n_data={N_DATA}, cp_len={CP_LEN}, "
           f"modem=qpsk, fec='rs_m8' (inner), fec1='conv_v27' (outer), crc=crc16, "
           f"sync=schmidl_cox, cfo=schmidl_cox, channel_estimator=ls, equalizer=mmse, "
@@ -124,8 +202,8 @@ def run() -> None:
           f"{ofdm.n_training_symbols} training + {ofdm.num_symbols_header} header + "
           f"{payload_symbols:.0f} payload OFDM symbols ({samples_per_symbol} samples/symbol each)")
 
-    # -- full TX chain: plain-timed, no profiler active -- this IS the
-    # headline number, so it must not carry any profiling overhead --
+    # -- full TX chain: plain-timed, NOTHING patched -- this IS the
+    # headline number, so it must not carry any instrumentation overhead --
     for _ in range(N_WARMUP):
         tx_probe_mac.send_iq(sdu)
     start = time.perf_counter()
@@ -144,21 +222,23 @@ def run() -> None:
     print(f"\nfull TX chain (send_iq(), {n_pdus_per_round} PDU(s)/SDU): "
           f"{tx_time_per_round * 1000:.4f} ms/SDU ({tx_time * 1000:.4f} ms/frame)")
 
-    # -- TX stage breakdown: a SEPARATE profiled pass over the exact same
-    # real send_iq() call -- proportions only, not the headline number
-    # (see module docstring) --
-    tx_profiler = cProfile.Profile()
-    tx_profiler.enable()
-    for _ in range(N_ROUNDS):
-        tx_probe_mac.send_iq(sdu)
-    tx_profiler.disable()
-    tx_stats = pstats.Stats(tx_profiler)
+    # -- TX stage breakdown: a SEPARATE stopwatch-instrumented pass over
+    # the exact same real send_iq() call -- proportions only, reconciled
+    # against the pristine headline tx_time above, not trusted as a total
+    # of its own (see module docstring for why a stopwatch, not cProfile) --
+    tx_timings: dict = defaultdict(float)
+    restore_tx = _install_timing_patch(tx_timings)
+    try:
+        for _ in range(N_ROUNDS):
+            tx_probe_mac.send_iq(sdu)
+    finally:
+        restore_tx()
     # /N_ROUNDS/n_pdus_per_round, not just /N_ROUNDS -- same per-round-vs-
     # per-frame fix as tx_time above (these functions run once per PDU).
-    crc_ms = _cumulative_time(tx_stats, "generate_key", "crc.py") / N_ROUNDS / n_pdus_per_round * 1000
-    conv_enc_ms = _cumulative_time(tx_stats, "encode", "viterbi.py") / N_ROUNDS / n_pdus_per_round * 1000
-    rs_enc_ms = _cumulative_time(tx_stats, "encode", "reed_solomon.py") / N_ROUNDS / n_pdus_per_round * 1000
-    print("TX stage breakdown (profiled pass -- proportions, see module docstring):")
+    crc_ms = tx_timings["crc_generate"] / N_ROUNDS / n_pdus_per_round * 1000
+    conv_enc_ms = tx_timings["conv_encode"] / N_ROUNDS / n_pdus_per_round * 1000
+    rs_enc_ms = tx_timings["rs_encode"] / N_ROUNDS / n_pdus_per_round * 1000
+    print("TX stage breakdown (stopwatch pass -- proportions, see module docstring):")
     accounted = 0.0
     for label, ms in [
         ("CRC key generation", crc_ms),
@@ -199,42 +279,42 @@ def run() -> None:
         print("  NOTE: a round not delivering doesn't necessarily mean a decode error -- see v1's")
         print("  module docstring for the ReassemblyBuffer window-eviction explanation.")
 
-    # -- RX stage breakdown: a SEPARATE profiled pass, same real call,
-    # fresh frames again -- proportions only, see module docstring --
+    # -- RX stage breakdown: a SEPARATE stopwatch-instrumented pass, same
+    # real call, fresh frames again -- proportions only, reconciled
+    # against the pristine headline rx_total above, see module docstring --
     profiled_rounds = [tx_mac.send_iq(sdu) for _ in range(N_ROUNDS)]
-    rx_profiler = cProfile.Profile()
-    rx_profiler.enable()
+    rx_timings: dict = defaultdict(float)
+    restore_rx = _install_timing_patch(rx_timings)
     n_calls_profiled = 0
-    for iq_frames in profiled_rounds:
-        for iq in iq_frames:
-            rx_mac.receive_iq(iq)
-            n_calls_profiled += 1
-    rx_profiler.disable()
-    rx_stats = pstats.Stats(rx_profiler)
+    try:
+        for iq_frames in profiled_rounds:
+            for iq in iq_frames:
+                rx_mac.receive_iq(iq)
+                n_calls_profiled += 1
+    finally:
+        restore_rx()
 
-    print(f"\nRX stage breakdown (profiled pass -- proportions, averaged over "
+    print(f"\nRX stage breakdown (stopwatch pass -- proportions, averaged over "
           f"{n_calls_profiled} frames, see module docstring):")
     buckets = [
-        ("sync detect + CFO", _cumulative_time(rx_stats, "process", "schmidl_cox.py")
-         + _cumulative_time(rx_stats, "correct", "schmidl_cox.py")),
-        ("OFDM decode (FFT+CP strip)", _cumulative_time(rx_stats, "process", "fft.py")),
-        ("channel estimation + equalization", _cumulative_time(rx_stats, "process", "ls.py")
-         + _cumulative_time(rx_stats, "process", "mmse.py")),
-        ("FEC decode -- Viterbi (fec1, outer)", _cumulative_time(rx_stats, "decode", "viterbi.py")),
-        ("FEC decode -- Reed-Solomon (fec0, inner)", _cumulative_time(rx_stats, "decode", "reed_solomon.py")),
-        ("MAC decode", _cumulative_time(rx_stats, "receive", "um.py")),
+        ("sync detect + CFO", rx_timings["sync_cfo"]),
+        ("OFDM decode (FFT+CP strip)", rx_timings["ofdm_decode"]),
+        ("channel estimation + equalization", rx_timings["chanest_eq"]),
+        ("FEC decode -- Viterbi (fec1, outer)", rx_timings["conv_decode"]),
+        ("FEC decode -- Reed-Solomon (fec0, inner)", rx_timings["rs_decode"]),
+        ("MAC decode", rx_timings["mac_decode"]),
     ]
     rx_accounted = 0.0
     for label, total_s in buckets:
         ms = total_s / n_calls_profiled * 1000
         rx_accounted += ms
         print(f"  {label:>50}: {ms:.4f} ms")
-    print(f"  {'everything else (profiler overhead + unbucketed)':>50}: "
+    print(f"  {'everything else (unbucketed -- header/resource-grid/reassembly/etc.)':>50}: "
           f"{max(rx_total - rx_accounted, 0.0):.4f} ms")
 
     # -- headline: what this actually means for sustained throughput,
     # using the PLAIN-TIMED numbers (tx_time/rx_total), never the
-    # profiled pass --
+    # stopwatch-instrumented pass --
     pdu_bits = len(pdus[0])
     tx_mbps = pdu_bits / (tx_time * 1000) / 1000  # bits / ms -> Mbps
     rx_mbps = pdu_bits / rx_total / 1000
