@@ -40,7 +40,7 @@ from typing import Any
 import numpy as np
 
 from ..block import Block
-from ._native import NativeConvolutional, native_available
+from ._native import NativeConvolutional, NativeConvolutionalSSE, native_available, sse_available
 
 _K = 7
 _G1 = 0o171  # NASA/CCSDS standard rate-1/2 K=7 generator polynomials
@@ -94,7 +94,18 @@ class ConvolutionalCode(Block):
         # trigger it -- re-verified across 210 message sizes (every
         # T-mod-8 residue) plus real bit-error injection against the
         # pure-Python path as ground truth before re-enabling here.
-        self._native = NativeConvolutional() if (self.backend == "numpy" and native_available()) else None
+        # Prefer the SSE4.1-accelerated native decode path over the
+        # portable one when both are available -- see
+        # fec/_native.py's sse_available() for the x86_64-and-runtime-
+        # cpuid gate this requires (declines automatically on ARM/
+        # Jetson, this project's actual deployment target, which then
+        # falls through to the portable native path exactly as before).
+        if self.backend == "numpy" and sse_available():
+            self._native = NativeConvolutionalSSE()
+        elif self.backend == "numpy" and native_available():
+            self._native = NativeConvolutional()
+        else:
+            self._native = None
 
         # Forward transition table (plain numpy -- tiny, built once,
         # independent of backend): for each of the 64 states and each

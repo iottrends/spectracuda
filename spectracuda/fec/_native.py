@@ -49,6 +49,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -59,12 +60,27 @@ import numpy as np
 
 _SRC_DIR = os.path.join(os.path.dirname(__file__), "_native_src", "libcorrect")
 _INCLUDE_DIR = os.path.join(_SRC_DIR, "include")
-_C_FILES = [
+_CONV_C_FILES = [
     os.path.join(_SRC_DIR, "src", "convolutional", f)
     for f in ("bit.c", "metric.c", "history_buffer.c", "error_buffer.c", "lookup.c", "convolutional.c", "encode.c", "decode.c")
-] + [
+]
+_C_FILES = _CONV_C_FILES + [
     os.path.join(_SRC_DIR, "src", "reed-solomon", f)
     for f in ("polynomial.c", "reed-solomon.c", "encode.c", "decode.c")
+]
+# SSE4.1-accelerated Viterbi decode (see sse_available()'s own docstring
+# for the two-part x86_64-and-runtime-cpuid gate this requires before
+# ever touching these symbols): the SAME base convolutional.c/decode.c
+# etc. as the portable build above, plus libcorrect's own
+# src/convolutional/sse/*.c, which reuses those base functions for
+# everything except the add-compare-select inner loop (vendored
+# unmodified from reference/libcorrect/src/convolutional/sse/ -- see
+# that upstream project's LICENSE, already vendored alongside the
+# portable sources this shares a directory with). No Reed-Solomon
+# equivalent exists upstream -- this is a Viterbi-only speedup.
+_SSE_SRC_DIR = os.path.join(_SRC_DIR, "src", "convolutional", "sse")
+_SSE_C_FILES = _CONV_C_FILES + [
+    os.path.join(_SSE_SRC_DIR, f) for f in ("lookup.c", "convolutional.c", "encode.c", "decode.c")
 ]
 
 _G1 = 0o171  # spectracuda's own conv_v27 polynomials (viterbi.py) -- verified interop
@@ -170,6 +186,140 @@ def native_available() -> bool:
     return _lib is not None
 
 
+_sse_lock = threading.Lock()
+_sse_checked = False
+_sse_lib: Optional[ctypes.CDLL] = None
+
+
+def _cpu_supports_sse41() -> bool:
+    """Runtime (not just compile-time) SSE4.1 feature check. This is
+    load-bearing, not a nicety: compiling with -msse4.1 only proves the
+    COMPILER can target that instruction set, not that the machine that
+    will eventually RUN this process has it -- a compiled .so can
+    outlive the machine it was built on (SPECTRACUDA_CACHE_DIR shared
+    across a fleet, a container image copied to different hardware,
+    etc.), and executing an SSE4.1 instruction on a CPU that lacks one
+    is SIGILL: an immediate, uncatchable process crash, not a Python
+    exception this module could fail silently out of like everything
+    else here. So this must be checked BEFORE the compiled library is
+    ever loaded, not discovered by trying it and catching a failure.
+
+    Linux-only (reads /proc/cpuinfo) -- declines (returns False) on any
+    other OS rather than guessing from platform.machine() alone, since
+    there's no equally cheap, dependency-free runtime feature read
+    available there. This only ever narrows sse_available() to a
+    subset of x86_64 Linux machines; it can never widen it, so the
+    failure mode of "declined when it could actually have run" is
+    always the safe direction."""
+    if sys.platform != "linux":
+        return False
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith(("flags", "Features")):
+                    return "sse4_1" in line.split()
+    except OSError:
+        return False
+    return False
+
+
+def _sse_source_hash() -> str:
+    h = hashlib.sha256()
+    for path in sorted(_SSE_C_FILES) + [
+        os.path.join(_INCLUDE_DIR, "correct.h"),
+        os.path.join(_INCLUDE_DIR, "correct-sse.h"),
+    ]:
+        with open(path, "rb") as f:
+            h.update(f.read())
+    h.update(sys.platform.encode())
+    # Unlike _source_hash() above (the portable build is plain C99, safe
+    # to share verbatim across architectures with the same sys.platform,
+    # and just fails a Python-level ctypes.CDLL() load if it ever isn't
+    # -- see native_available()'s except clause), this one MUST include
+    # the machine architecture: an x86_64-compiled SSE .so handed to an
+    # ARM/Jetson process by a cache directory shared across machines
+    # wouldn't just fail to load, it could pass the ELF-format check for
+    # a *different* x86_64 machine and then SIGILL -- see
+    # _cpu_supports_sse41()'s own docstring. Keeping this hash disjoint
+    # from _source_hash() means the two builds never collide on
+    # filename either.
+    h.update(platform.machine().encode())
+    return h.hexdigest()[:16]
+
+
+def _compile_sse(so_path: str) -> None:
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if cc is None:
+        raise RuntimeError("no C compiler (cc/gcc/clang) found")
+    cmd = [cc, "-O2", "-fPIC", "-std=c99", "-msse4.1", "-I", _INCLUDE_DIR, "-shared", "-o", so_path] + _SSE_C_FILES + ["-lm"]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(f"native SSE FEC backend compile failed: {result.stderr[-2000:]}")
+
+
+def _bind_sse_signatures(lib: ctypes.CDLL) -> None:
+    lib.correct_convolutional_sse_create.restype = ctypes.c_void_p
+    lib.correct_convolutional_sse_create.argtypes = [ctypes.c_size_t, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint16)]
+    lib.correct_convolutional_sse_destroy.argtypes = [ctypes.c_void_p]
+    lib.correct_convolutional_sse_encode_len.restype = ctypes.c_size_t
+    lib.correct_convolutional_sse_encode_len.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.correct_convolutional_sse_encode.restype = ctypes.c_size_t
+    lib.correct_convolutional_sse_encode.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint8)
+    ]
+    lib.correct_convolutional_sse_decode.restype = ctypes.c_ssize_t
+    lib.correct_convolutional_sse_decode.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint8)
+    ]
+
+
+def sse_available() -> bool:
+    """True if the SSE4.1-accelerated Viterbi decode path is compiled,
+    loaded, AND verified safe to execute on THIS cpu. Checked once per
+    process, cached -- same rationale as native_available().
+
+    Gated on two independent conditions, both required:
+      - platform.machine() says x86_64/AMD64 -- SSE4.1 doesn't exist
+        anywhere else. ARM/Jetson (this project's actual deployment
+        target) always declines this and uses native_available()'s
+        portable path instead -- see this module's own docstring for
+        why that SIMD build was deliberately left out of the always-on
+        native path in the first place.
+      - _cpu_supports_sse41() -- see its own docstring for why a
+        runtime check is required here and a compile-time success is
+        not enough evidence on its own.
+
+    Fully independent of native_available() (the portable build): a
+    separate .so, from a disjoint hash (_sse_source_hash(), not
+    _source_hash()), that can be available, unavailable, or absent
+    independently of the portable path's own status. Same "fails
+    silently and permanently" contract as native_available() for every
+    OTHER failure mode (no compiler, compile error, etc.) -- only the
+    two gates above are checked ahead of time rather than discovered by
+    failure, because a wrong guess there is a crash, not an exception."""
+    global _sse_checked, _sse_lib
+    if _sse_checked:
+        return _sse_lib is not None
+    with _sse_lock:
+        if _sse_checked:
+            return _sse_lib is not None
+        _sse_checked = True
+        if platform.machine() not in ("x86_64", "AMD64") or not _cpu_supports_sse41():
+            return False
+        try:
+            so_path = os.path.join(_cache_dir(), f"libcorrect_sse_{_sse_source_hash()}.so")
+            if not os.path.exists(so_path):
+                tmp_path = so_path + f".tmp{os.getpid()}"
+                _compile_sse(tmp_path)
+                os.replace(tmp_path, so_path)  # atomic -- same race-avoidance as native_available()
+            lib = ctypes.CDLL(so_path)
+            _bind_sse_signatures(lib)
+            _sse_lib = lib
+        except Exception:
+            _sse_lib = None
+    return _sse_lib is not None
+
+
 class NativeConvolutional:
     """Drop-in accelerated backend for ConvolutionalCode's encode()/
     decode() -- exact same batch-shape contract. Persistent
@@ -231,6 +381,74 @@ class NativeConvolutional:
         encoded_bytes = np.packbits(padded_bits)
         msg_out = (ctypes.c_uint8 * (Tp // 8 + 8))()
         n_written = _lib.correct_convolutional_decode(self._conv, encoded_bytes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), 2 * Tp, msg_out)
+        decoded = np.unpackbits(np.frombuffer(bytes(msg_out[: max(n_written, 0)]), dtype="uint8"))
+        return decoded[:k]
+
+    def encode(self, bits: np.ndarray) -> np.ndarray:
+        bits = np.asarray(bits, dtype="uint8")
+        return np.stack([self._encode_one(bits[b]) for b in range(bits.shape[0])])
+
+    def decode(self, bits: np.ndarray) -> np.ndarray:
+        bits = np.asarray(bits, dtype="uint8")
+        return np.stack([self._decode_one(bits[b]) for b in range(bits.shape[0])])
+
+
+class NativeConvolutionalSSE:
+    """SSE4.1-accelerated drop-in for ConvolutionalCode's encode()/
+    decode() -- see sse_available()'s own docstring for the gating this
+    requires before this class may even be constructed. Same batch-
+    shape contract as NativeConvolutional, and the same
+    _DECODE_PAD_PAIRS decode-side workaround: libcorrect's SSE build
+    reuses the base build's history_buffer/bit_writer code UNCHANGED
+    (only the add-compare-select inner loop is replaced -- see
+    src/convolutional/sse/decode.c), so the withheld-bits quirk that
+    fix addresses is identical here, not something the SSE path happens
+    to also have -- verified independently with the same k=1, 6, 39,
+    194, 4001, 4002 sweep NativeConvolutional's own docstring describes,
+    against both the portable native path and the pure-Python decoder
+    as ground truth, before trusting this.
+
+    encode() has no separate speed claim here: libcorrect's own SSE
+    encode() (src/convolutional/sse/encode.c) just calls straight
+    through to the identical portable correct_convolutional_encode()
+    under the hood -- only decode() (the actual bottleneck -- Viterbi
+    add-compare-select, not the encoder's simple shift-register
+    convolution) got the SIMD treatment upstream. Kept here anyway
+    (rather than falling back to NativeConvolutional's encode for this
+    one method) so a single class fully owns one correct_convolutional_
+    sse instance's lifetime instead of splitting it across two native
+    handles."""
+
+    def __init__(self) -> None:
+        if not sse_available():
+            raise RuntimeError("native SSE FEC backend is not available")
+        poly = (ctypes.c_uint16 * 2)(_G1, _G2)
+        self._conv = _sse_lib.correct_convolutional_sse_create(2, 7, poly)
+        if not self._conv:
+            raise RuntimeError("correct_convolutional_sse_create failed")
+
+    def _encode_one(self, msg_bits: np.ndarray) -> np.ndarray:
+        k = len(msg_bits)
+        padded = np.concatenate([msg_bits, np.zeros(_TAIL_BITS, dtype="uint8")])
+        msg_bytes = np.packbits(padded)
+        enc_len_bits = _sse_lib.correct_convolutional_sse_encode_len(self._conv, len(msg_bytes))
+        encoded = (ctypes.c_uint8 * (enc_len_bits // 8 + 8))()
+        _sse_lib.correct_convolutional_sse_encode(self._conv, msg_bytes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), len(msg_bytes), encoded)
+        want_bits = 2 * (k + _TAIL_BITS)
+        encoded_bytes = np.frombuffer(bytes(encoded[: want_bits // 8 + 1]), dtype="uint8")
+        return np.unpackbits(encoded_bytes)[:want_bits]
+
+    def _decode_one(self, encoded_bits: np.ndarray) -> np.ndarray:
+        # See NativeConvolutional._decode_one's own docstring for the
+        # full withheld-bits story -- identical fix, identical margin,
+        # this class's own docstring for why that's expected here too.
+        T = len(encoded_bits) // 2
+        k = T - _TAIL_BITS
+        padded_bits = np.concatenate([encoded_bits, np.zeros(2 * _DECODE_PAD_PAIRS, dtype="uint8")])
+        Tp = T + _DECODE_PAD_PAIRS
+        encoded_bytes = np.packbits(padded_bits)
+        msg_out = (ctypes.c_uint8 * (Tp // 8 + 8))()
+        n_written = _sse_lib.correct_convolutional_sse_decode(self._conv, encoded_bytes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), 2 * Tp, msg_out)
         decoded = np.unpackbits(np.frombuffer(bytes(msg_out[: max(n_written, 0)]), dtype="uint8"))
         return decoded[:k]
 
