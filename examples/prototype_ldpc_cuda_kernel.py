@@ -216,6 +216,123 @@ void ldpc_min_sum_decode(
 }
 """
 
+# Second kernel: the SAME algorithm as ldpc_min_sum_decode above -- every
+# check-update/var-update formula is byte-for-byte identical, deliberately
+# not re-derived -- with q_flat/r_flat/channel_llr moved from a
+# (n_batch, ...) slice of GLOBAL memory into a per-block SHARED memory
+# buffer, loaded once at the start and never touching global memory again
+# until the final output write. This is cuPHY's second real technique
+# (reference/aerial-cuda-accelerated-ran-NOTES.md) -- keeping each
+# codeword's working set on-chip for the whole decode instead of round-
+# tripping the whole batch through global memory every iteration, which
+# examples/prototype_ldpc_cuda_kernel.py's own benchmark_speed() showed
+# is the real ceiling the global-memory kernel hits (Mbps plateaus
+# ~17-19 regardless of batch size from 32 upward -- a bandwidth ceiling,
+# not a launch-count one, since launch-count is already fixed at 1
+# either way).
+#
+# Shared memory needed = (n + 2*n_edges) * 4 bytes (float32). Varies by
+# LDPC variant -- see this file's own module docstring / the commit that
+# added this kernel for the exact per-variant numbers: ldpc_648_* needs
+# only ~21KB (fits under every CUDA GPU's default 48KB per-block limit,
+# no special opt-in needed -- the SAFE variant to validate this on
+# first); ldpc_1296_* needs ~40-42KB (still under 48KB, should be safe
+# on most GPUs); ldpc_1944_* needs ~58-63KB -- OVER the default limit,
+# requires cupy's max_dynamic_shared_size_bytes opt-in (see
+# cuda_ldpc_decode_shared() below), and may not even fit depending on
+# the specific GPU's actual shared memory budget.
+_LDPC_MIN_SUM_SHARED_KERNEL_SRC = r"""
+extern "C" __global__
+void ldpc_min_sum_decode_shared(
+    const float* __restrict__ channel_llr_g,        // (n_batch, n) -- global, loaded into shared once
+    const long long* __restrict__ check_slot_edges, // (n_checks, max_check_degree) -- global, read-only, shared across batch
+    const int* __restrict__ check_degree,
+    const long long* __restrict__ var_slot_edges,   // (n, max_var_degree) -- global, read-only, shared across batch
+    const int* __restrict__ var_degree,
+    const long long* __restrict__ edge_owner_var,
+    unsigned char* __restrict__ hard_bits,          // (n_batch, n) output, global
+    int n, int n_edges, int n_checks,
+    int max_check_degree, int max_var_degree,
+    int n_iterations, float alpha)
+{
+    extern __shared__ float smem[];
+    float* my_llr = smem;                // n floats
+    float* my_q   = smem + n;            // n_edges floats
+    float* my_r   = smem + n + n_edges;  // n_edges floats
+
+    int b = blockIdx.x;  // one block per codeword
+    const float* llr_g = channel_llr_g + (size_t)b * n;
+    unsigned char* my_out = hard_bits + (size_t)b * n;
+
+    // --- load channel LLRs from global into shared memory, ONCE ---
+    for (int v = threadIdx.x; v < n; v += blockDim.x) {
+        my_llr[v] = llr_g[v];
+    }
+    __syncthreads();
+
+    // --- init: q_flat[e] = channel_llr[edge_owner_var[e]] --- (shared-memory copy now)
+    for (int e = threadIdx.x; e < n_edges; e += blockDim.x) {
+        my_q[e] = my_llr[edge_owner_var[e]];
+    }
+    __syncthreads();
+
+    for (int iter = 0; iter < n_iterations; ++iter) {
+        // --- check-to-var update --- (identical math to ldpc_min_sum_decode above)
+        for (int c = threadIdx.x; c < n_checks; c += blockDim.x) {
+            int deg = check_degree[c];
+            const long long* edges = check_slot_edges + (size_t)c * max_check_degree;
+
+            float min1 = 3.0e38f, min2 = 3.0e38f;
+            int   min1_j = -1;
+            float sign_product = 1.0f;
+            for (int j = 0; j < deg; ++j) {
+                float q = my_q[edges[j]];
+                float mag = fabsf(q);
+                float s = (q < 0.0f) ? -1.0f : 1.0f;
+                sign_product *= s;
+                if (mag < min1) { min2 = min1; min1 = mag; min1_j = j; }
+                else if (mag < min2) { min2 = mag; }
+            }
+            for (int j = 0; j < deg; ++j) {
+                long long e = edges[j];
+                float q = my_q[e];
+                float s = (q < 0.0f) ? -1.0f : 1.0f;
+                float out_mag  = (j == min1_j) ? min2 : min1;
+                float out_sign = sign_product * s;
+                my_r[e] = alpha * out_sign * out_mag;
+            }
+        }
+        __syncthreads();
+
+        // --- var-to-check update --- (identical math to ldpc_min_sum_decode above)
+        for (int v = threadIdx.x; v < n; v += blockDim.x) {
+            int deg = var_degree[v];
+            const long long* edges = var_slot_edges + (size_t)v * max_var_degree;
+            float total = my_llr[v];
+            for (int j = 0; j < deg; ++j) {
+                total += my_r[edges[j]];
+            }
+            for (int j = 0; j < deg; ++j) {
+                long long e = edges[j];
+                my_q[e] = total - my_r[e];
+            }
+        }
+        __syncthreads();
+    }
+
+    // --- final hard decision --- (identical to ldpc_min_sum_decode above)
+    for (int v = threadIdx.x; v < n; v += blockDim.x) {
+        int deg = var_degree[v];
+        const long long* edges = var_slot_edges + (size_t)v * max_var_degree;
+        float total = my_llr[v];
+        for (int j = 0; j < deg; ++j) {
+            total += my_r[edges[j]];
+        }
+        my_out[v] = (total < 0.0f) ? 1 : 0;
+    }
+}
+"""
+
 _BLOCK_SIZE = 256  # threads/block -- a grid-stride loop inside the kernel handles
                     # n_checks/n both being larger (or smaller) than this
 
@@ -283,16 +400,82 @@ def cuda_ldpc_decode(ldpc: LDPCCode, encoded_bits, p: float = 0.02, max_iteratio
     return hard_bits[:, : ldpc.k]
 
 
-def verify_correctness(variant: str = "ldpc_1944_r12") -> bool:
-    """The real gate this prototype needs to clear before anyone
-    trusts it -- NOT run yet (no GPU on the machine that wrote this).
-    Encodes random messages with the EXISTING, trusted encode(),
-    decodes with both the existing array-op decode() (ground truth)
-    and this kernel, for CLEAN codewords and for codewords with real
-    injected bit errors (within the code's correction capability) --
-    same discipline fec/ldpc.py's own module docstring and fec/
-    _native.py's Viterbi verification history both used: a single
-    clean-codeword pass is not enough on its own."""
+def cuda_ldpc_decode_shared(ldpc: LDPCCode, encoded_bits, p: float = 0.02, max_iterations=None):
+    """Same contract as cuda_ldpc_decode() above, via the shared-memory
+    kernel instead -- see _LDPC_MIN_SUM_SHARED_KERNEL_SRC's own comment
+    for the shared-memory budget per LDPC variant (ldpc_648_* is the
+    safe one to try first: ~21KB, fits under every GPU's default 48KB
+    limit with no special opt-in).
+
+    Raises RuntimeError with a clear, actionable message (not a bare
+    CUDA error) if this variant's shared-memory requirement exceeds
+    what this specific GPU supports -- cupy's own
+    max_dynamic_shared_size_bytes assignment is what surfaces that
+    failure; caught and re-raised here with the actual numbers involved
+    rather than a cryptic underlying CUDA error code."""
+    import cupy
+
+    if ldpc.backend != "cupy":
+        raise ValueError("cuda_ldpc_decode_shared requires a backend='cupy' LDPCCode instance")
+
+    bits = cupy.asarray(encoded_bits)
+    if bits.ndim == 1:
+        bits = bits[None, :]
+    if bits.shape[-1] != ldpc.n:
+        raise ValueError(f"expected {ldpc.n} codeword bits, got {bits.shape[-1]}")
+    n_batch = bits.shape[0]
+    n_iterations = ldpc.max_iterations if max_iterations is None else max_iterations
+
+    import math
+    llr_scale = float(math.log((1 - p) / p))
+    channel_llr = ((1 - 2 * bits.astype("float32")) * llr_scale).astype("float32")
+
+    check_degree, var_degree = _kernel_support_arrays(ldpc)
+    hard_bits = cupy.empty((n_batch, ldpc.n), dtype="uint8")
+
+    shared_bytes = (ldpc.n + 2 * ldpc.n_edges) * 4  # float32: channel_llr + q_flat + r_flat
+    kernel = cupy.RawKernel(_LDPC_MIN_SUM_SHARED_KERNEL_SRC, "ldpc_min_sum_decode_shared")
+    if shared_bytes > 48 * 1024:  # CUDA's default per-block limit -- above this NEEDS the opt-in below
+        try:
+            kernel.max_dynamic_shared_size_bytes = shared_bytes
+        except Exception as exc:
+            raise RuntimeError(
+                f"variant {ldpc.variant!r} needs {shared_bytes} bytes ({shared_bytes/1024:.1f} KB) of "
+                f"per-block shared memory, which this GPU could not provide (underlying error: {exc}). "
+                f"Try a smaller variant instead -- e.g. ldpc_648_* needs only ~21KB, well under every "
+                f"CUDA GPU's default 48KB limit."
+            ) from exc
+
+    kernel(
+        (n_batch,), (_BLOCK_SIZE,),
+        (
+            channel_llr,
+            ldpc._check_slot_edges.astype("int64"), check_degree,
+            ldpc._var_slot_edges.astype("int64"), var_degree,
+            ldpc._edge_owner_var.astype("int64"),
+            hard_bits,
+            np.int32(ldpc.n), np.int32(ldpc.n_edges), np.int32(ldpc.mb * ldpc.Z),
+            np.int32(ldpc.max_check_degree), np.int32(ldpc.max_var_degree),
+            np.int32(n_iterations), np.float32(_MIN_SUM_ALPHA),
+        ),
+        shared_mem=shared_bytes,
+    )
+    return hard_bits[:, : ldpc.k]
+
+
+def verify_correctness(variant: str = "ldpc_1944_r12", decode_fn=None, label: str = "kernel") -> bool:
+    """The real gate any of these kernels needs to clear before anyone
+    trusts them. Encodes random messages with the EXISTING, trusted
+    encode(), decodes with both the existing array-op decode() (ground
+    truth) and `decode_fn` (defaults to the global-memory kernel,
+    cuda_ldpc_decode -- pass cuda_ldpc_decode_shared to test the
+    shared-memory one instead), for CLEAN codewords and for codewords
+    with real injected bit errors (within the code's correction
+    capability) -- same discipline fec/ldpc.py's own module docstring
+    and fec/_native.py's Viterbi verification history both used: a
+    single clean-codeword pass is not enough on its own."""
+    if decode_fn is None:
+        decode_fn = cuda_ldpc_decode
     if not cupy_available():
         print("No working CuPy/CUDA runtime detected -- run this on a GPU machine "
               "(e.g. Colab) instead. See this script's own module docstring.")
@@ -303,6 +486,7 @@ def verify_correctness(variant: str = "ldpc_1944_r12") -> bool:
     rng = np.random.default_rng(0)
     all_ok = True
 
+    print(f"--- verify_correctness: variant={variant!r}, {label} ---")
     for batch in [1, 4, 16]:
         for n_errors in [0, 1, 2]:  # 0 = clean; 1-2 = real injected BSC errors
             msg = rng.integers(0, 2, size=(batch, numpy_ldpc.k)).astype("uint8")
@@ -314,7 +498,7 @@ def verify_correctness(variant: str = "ldpc_1944_r12") -> bool:
                     corrupted[b, flip] ^= 1
 
             ref = np.asarray(numpy_ldpc.decode(corrupted, p=0.02))
-            kernel_out = np.asarray(cuda_ldpc_decode(cupy_ldpc, corrupted, p=0.02).get())
+            kernel_out = np.asarray(decode_fn(cupy_ldpc, corrupted, p=0.02).get())
 
             ok = np.array_equal(ref, msg) and np.array_equal(kernel_out, msg)
             all_ok &= ok
@@ -323,7 +507,8 @@ def verify_correctness(variant: str = "ldpc_1944_r12") -> bool:
                   f"kernel_matches_ref={np.array_equal(kernel_out, ref)} "
                   f"{'OK' if ok else 'MISMATCH !!'}")
 
-    print(f"\n{'ALL PASSED' if all_ok else 'SOME FAILED -- do NOT trust/promote this kernel yet'}")
+    print(f"\n{'ALL PASSED' if all_ok else 'SOME FAILED -- do NOT trust/promote this kernel yet'} "
+          f"({label}, variant={variant!r})")
     return all_ok
 
 
@@ -342,63 +527,90 @@ def _sync() -> None:
     cupy.cuda.Stream.null.synchronize()
 
 
-def benchmark_speed(variant: str = "ldpc_1944_r12") -> None:
-    """Only meaningful to run AFTER verify_correctness() has passed --
-    a fast wrong answer is not a result. Same warmup + Stream.null.
-    synchronize() protections as examples/benchmark_ldpc_cuda.py (this
-    project's own established cupy-timing pattern), decoding a CLEAN
-    codeword each call (same "best-case, matches the CPU-side
-    methodology" reasoning documented in benchmark_ldpc_cuda.py's own
-    module docstring)."""
+def _time_decode(decode_fn, ldpc, encoded) -> float:
+    for _ in range(_N_WARMUP):
+        decode_fn(ldpc, encoded, p=0.02) if decode_fn is not None else ldpc.decode(encoded, p=0.02)
+    _sync()
+    start = time.perf_counter()
+    for _ in range(_N_ITERS):
+        decode_fn(ldpc, encoded, p=0.02) if decode_fn is not None else ldpc.decode(encoded, p=0.02)
+    _sync()
+    return (time.perf_counter() - start) / _N_ITERS
+
+
+def benchmark_speed(variant: str = "ldpc_1944_r12", extra_kernels=()) -> None:
+    """Only meaningful to run AFTER verify_correctness() has passed for
+    every kernel included -- a fast wrong answer is not a result. Same
+    warmup + Stream.null.synchronize() protections as examples/
+    benchmark_ldpc_cuda.py (this project's own established cupy-timing
+    pattern), decoding a CLEAN codeword each call (same "best-case,
+    matches the CPU-side methodology" reasoning documented in that
+    script's own module docstring).
+
+    `extra_kernels`: list of (label, decode_fn) pairs beyond the
+    built-in "array-op" (LDPCCode.decode() itself) and "global-mem
+    kernel" (cuda_ldpc_decode) columns -- pass
+    [("shared-mem kernel", cuda_ldpc_decode_shared)] to add that
+    comparison too. Any kernel that raises for this variant (e.g. the
+    shared-memory one on a variant whose working set doesn't fit on
+    this GPU) prints the error for that column and continues with the
+    rest, rather than aborting the whole sweep."""
     if not cupy_available():
         print("No working CuPy/CUDA runtime detected -- run this on a GPU machine instead.")
         return
     import cupy
 
-    array_op_ldpc = LDPCCode(variant, backend="cupy")
-    kernel_ldpc = LDPCCode(variant, backend="cupy")  # separate instance -- no shared mutable state, matches
-                                                       # this project's own "one handle per concurrent user" caution
+    columns = [("array-op", None), ("global-mem kernel", cuda_ldpc_decode), *extra_kernels]
     rng = np.random.default_rng(0)
 
-    print(f"\n=== speed: array-op decode() vs fused kernel, variant={variant!r} ===")
-    print(f"{'batch':>7} | {'array-op ms':>12} | {'kernel ms':>10} | {'speedup':>8} | "
-          f"{'array-op Mbps':>13} | {'kernel Mbps':>11}")
-    print("-" * 80)
+    print(f"\n=== speed: {' vs '.join(label for label, _ in columns)}, variant={variant!r} ===")
+    header = f"{'batch':>7} | " + " | ".join(f"{label + ' ms':>16}" for label, _ in columns)
+    print(header)
+    print("-" * len(header))
     for batch in _SPEED_BATCH_SIZES:
-        msg = rng.integers(0, 2, size=(batch, array_op_ldpc.k)).astype("uint8")
-        encoded = cupy.asarray(array_op_ldpc.encode(msg))
+        ldpc = LDPCCode(variant, backend="cupy")
+        msg = rng.integers(0, 2, size=(batch, ldpc.k)).astype("uint8")
+        encoded = cupy.asarray(ldpc.encode(msg))
+        total_bits = batch * ldpc.k
 
-        for _ in range(_N_WARMUP):
-            array_op_ldpc.decode(encoded, p=0.02)
-        _sync()
-        start = time.perf_counter()
-        for _ in range(_N_ITERS):
-            array_op_ldpc.decode(encoded, p=0.02)
-        _sync()
-        array_op_s = (time.perf_counter() - start) / _N_ITERS
-
-        for _ in range(_N_WARMUP):
-            cuda_ldpc_decode(kernel_ldpc, encoded, p=0.02)
-        _sync()
-        start = time.perf_counter()
-        for _ in range(_N_ITERS):
-            cuda_ldpc_decode(kernel_ldpc, encoded, p=0.02)
-        _sync()
-        kernel_s = (time.perf_counter() - start) / _N_ITERS
-
-        total_bits = batch * array_op_ldpc.k
-        print(f"{batch:>7} | {array_op_s*1000:>12.4f} | {kernel_s*1000:>10.4f} | "
-              f"{array_op_s/kernel_s:>7.2f}x | {total_bits/array_op_s/1e6:>13.2f} | "
-              f"{total_bits/kernel_s/1e6:>11.2f}")
+        times_ms = []
+        for label, decode_fn in columns:
+            try:
+                # fresh LDPCCode instance per column -- no shared mutable state across kernels/columns
+                col_ldpc = LDPCCode(variant, backend="cupy")
+                t = _time_decode(decode_fn, col_ldpc, encoded)
+                times_ms.append(f"{t*1000:>13.4f}")
+            except Exception as exc:  # e.g. shared-memory kernel not fitting this GPU/variant
+                times_ms.append("FAILED")
+                print(f"  [{label} @ batch={batch}] {exc}")
+        print(f"{batch:>7} | " + " | ".join(f"{t:>16}" for t in times_ms))
 
     print(f"\nFor reference, this project's own CPU rs_m8+conv_v27 (already-optimized, "
-          f"real measured throughput this whole session): ~{_CPU_BASELINE_MBPS:.0f} Mbps -- "
-          f"that's the number the kernel Mbps column above actually needs to beat, not just "
-          f"the array-op column next to it.")
+          f"real measured throughput this whole session): ~{_CPU_BASELINE_MBPS:.0f} Mbps.")
 
 
 if __name__ == "__main__":
-    if verify_correctness():
-        benchmark_speed()
-    else:
-        print("\nSkipping speed benchmark -- correctness failed, a fast wrong answer isn't useful.")
+    global_ok = verify_correctness("ldpc_1944_r12", cuda_ldpc_decode, "global-mem kernel")
+
+    # The shared-memory kernel: validate first against the SAFE variant
+    # (~21KB, fits under every GPU's default 48KB limit, no opt-in
+    # needed -- see _LDPC_MIN_SUM_SHARED_KERNEL_SRC's own comment) --
+    # then attempt the real variant used throughout this project's own
+    # benchmark history, which may or may not fit depending on this
+    # specific GPU's shared memory budget.
+    shared_ok_small = verify_correctness("ldpc_648_r12", cuda_ldpc_decode_shared, "shared-mem kernel")
+    shared_ok_real = False
+    if shared_ok_small:
+        try:
+            shared_ok_real = verify_correctness("ldpc_1944_r12", cuda_ldpc_decode_shared, "shared-mem kernel")
+        except Exception as exc:
+            print(f"\nshared-mem kernel on ldpc_1944_r12: FAILED to even launch -- {exc}")
+
+    if global_ok:
+        benchmark_speed("ldpc_1944_r12")
+    if shared_ok_small:
+        benchmark_speed("ldpc_648_r12", extra_kernels=[("shared-mem kernel", cuda_ldpc_decode_shared)])
+    if shared_ok_real:
+        benchmark_speed("ldpc_1944_r12", extra_kernels=[("shared-mem kernel", cuda_ldpc_decode_shared)])
+    if not (global_ok or shared_ok_small):
+        print("\nSkipping all speed benchmarks -- correctness failed, a fast wrong answer isn't useful.")
