@@ -337,17 +337,83 @@ _BLOCK_SIZE = 256  # threads/block -- a grid-stride loop inside the kernel handl
                     # n_checks/n both being larger (or smaller) than this
 
 
-def _kernel_support_arrays(ldpc: LDPCCode):
-    """Derives the few extra arrays this kernel needs (check_degree/
-    var_degree as plain counts) from LDPCCode's OWN already-computed,
-    already-trusted tables -- not re-deriving the edge/check/var
-    structure from scratch, to keep this prototype's own surface area
-    (and bug risk) as small as possible. Returns cupy int32 arrays."""
+_global_kernel = None       # compiled once, reused -- see _get_global_kernel()
+_shared_kernel = None        # compiled once, reused -- see _get_shared_kernel()
+_shared_kernel_configured_bytes = None  # last max_dynamic_shared_size_bytes actually SET on
+                                          # _shared_kernel -- re-set only when it needs to change
+                                          # (e.g. switching LDPC variant mid-process), not every call
+
+
+def _get_global_kernel():
+    """Compiled/loaded ONCE per process, not per decode() call -- the
+    original per-call cupy.RawKernel(...) construction was a real,
+    measured source of avoidable per-call overhead (found by comparing
+    small-batch vs large-batch Mbps on real Colab hardware -- see this
+    file's own commit history), the same class of mistake this
+    project's own native FEC .so compilation caching and per-frame
+    Packetizer caching already fixed twice elsewhere this session."""
+    global _global_kernel
     import cupy
 
-    check_degree = cupy.asnumpy(ldpc._check_slot_mask).sum(axis=-1).astype("int32")
-    var_degree = cupy.asnumpy(ldpc._var_slot_mask).sum(axis=-1).astype("int32")
-    return cupy.asarray(check_degree), cupy.asarray(var_degree)
+    if _global_kernel is None:
+        _global_kernel = cupy.RawKernel(_LDPC_MIN_SUM_KERNEL_SRC, "ldpc_min_sum_decode")
+    return _global_kernel
+
+
+def _get_shared_kernel(shared_bytes: int):
+    """Same caching as _get_global_kernel(), plus: only reassigns
+    max_dynamic_shared_size_bytes when the REQUESTED size actually
+    differs from what's currently configured (switching LDPC variant
+    mid-process is the only time that happens for a fixed GPU) --
+    avoids a redundant attribute-set (and its underlying
+    cudaFuncSetAttribute call) on every single decode()."""
+    global _shared_kernel, _shared_kernel_configured_bytes
+    import cupy
+
+    if _shared_kernel is None:
+        _shared_kernel = cupy.RawKernel(_LDPC_MIN_SUM_SHARED_KERNEL_SRC, "ldpc_min_sum_decode_shared")
+    if shared_bytes > 48 * 1024 and _shared_kernel_configured_bytes != shared_bytes:
+        try:
+            _shared_kernel.max_dynamic_shared_size_bytes = shared_bytes
+            _shared_kernel_configured_bytes = shared_bytes
+        except Exception as exc:
+            raise RuntimeError(
+                f"needs {shared_bytes} bytes ({shared_bytes/1024:.1f} KB) of per-block shared "
+                f"memory, which this GPU could not provide (underlying error: {exc}). Try a "
+                f"smaller variant instead -- e.g. ldpc_648_* needs only ~21KB, well under every "
+                f"CUDA GPU's default 48KB limit."
+            ) from exc
+    return _shared_kernel
+
+
+def _kernel_support_arrays(ldpc: LDPCCode):
+    """Derives the few extra arrays these kernels need (check_degree/
+    var_degree as plain counts, plus int64-cast copies of the edge
+    tables) from LDPCCode's OWN already-computed, already-trusted
+    tables -- not re-deriving the edge/check/var structure from
+    scratch. Cached as a private attribute ON THE ldpc INSTANCE ITSELF
+    (tying the cache's lifetime to the object that owns the underlying
+    tables, rather than a separate id()-keyed global dict that could
+    go stale if an ldpc instance were garbage-collected and its id
+    reused) -- computing this fresh on every decode() call was another
+    real, avoidable per-call cost: cupy.asnumpy(...).sum(...) is a
+    host round-trip, and .astype("int64") on arrays that are ALREADY
+    int64 still pays a full copy unless told copy=False."""
+    cached = getattr(ldpc, "_cuda_kernel_support_cache", None)
+    if cached is not None:
+        return cached
+
+    import cupy
+
+    check_degree = cupy.asarray(cupy.asnumpy(ldpc._check_slot_mask).sum(axis=-1).astype("int32"))
+    var_degree = cupy.asarray(cupy.asnumpy(ldpc._var_slot_mask).sum(axis=-1).astype("int32"))
+    check_slot_edges_i64 = ldpc._check_slot_edges.astype("int64", copy=False)
+    var_slot_edges_i64 = ldpc._var_slot_edges.astype("int64", copy=False)
+    edge_owner_var_i64 = ldpc._edge_owner_var.astype("int64", copy=False)
+
+    cached = (check_degree, var_degree, check_slot_edges_i64, var_slot_edges_i64, edge_owner_var_i64)
+    ldpc._cuda_kernel_support_cache = cached
+    return cached
 
 
 def cuda_ldpc_decode(ldpc: LDPCCode, encoded_bits, p: float = 0.02, max_iterations=None):
@@ -377,20 +443,21 @@ def cuda_ldpc_decode(ldpc: LDPCCode, encoded_bits, p: float = 0.02, max_iteratio
     llr_scale = float(math.log((1 - p) / p))
     channel_llr = ((1 - 2 * bits.astype("float32")) * llr_scale).astype("float32")
 
-    check_degree, var_degree = _kernel_support_arrays(ldpc)
+    check_degree, var_degree, check_slot_edges_i64, var_slot_edges_i64, edge_owner_var_i64 = \
+        _kernel_support_arrays(ldpc)
 
     q_flat = cupy.empty((n_batch, ldpc.n_edges), dtype="float32")
     r_flat = cupy.empty((n_batch, ldpc.n_edges), dtype="float32")
     hard_bits = cupy.empty((n_batch, ldpc.n), dtype="uint8")
 
-    kernel = cupy.RawKernel(_LDPC_MIN_SUM_KERNEL_SRC, "ldpc_min_sum_decode")
+    kernel = _get_global_kernel()
     kernel(
         (n_batch,), (_BLOCK_SIZE,),
         (
             channel_llr, q_flat, r_flat,
-            ldpc._check_slot_edges.astype("int64"), check_degree,
-            ldpc._var_slot_edges.astype("int64"), var_degree,
-            ldpc._edge_owner_var.astype("int64"),
+            check_slot_edges_i64, check_degree,
+            var_slot_edges_i64, var_degree,
+            edge_owner_var_i64,
             hard_bits,
             np.int32(ldpc.n), np.int32(ldpc.n_edges), np.int32(ldpc.mb * ldpc.Z),
             np.int32(ldpc.max_check_degree), np.int32(ldpc.max_var_degree),
@@ -430,29 +497,20 @@ def cuda_ldpc_decode_shared(ldpc: LDPCCode, encoded_bits, p: float = 0.02, max_i
     llr_scale = float(math.log((1 - p) / p))
     channel_llr = ((1 - 2 * bits.astype("float32")) * llr_scale).astype("float32")
 
-    check_degree, var_degree = _kernel_support_arrays(ldpc)
+    check_degree, var_degree, check_slot_edges_i64, var_slot_edges_i64, edge_owner_var_i64 = \
+        _kernel_support_arrays(ldpc)
     hard_bits = cupy.empty((n_batch, ldpc.n), dtype="uint8")
 
     shared_bytes = (ldpc.n + 2 * ldpc.n_edges) * 4  # float32: channel_llr + q_flat + r_flat
-    kernel = cupy.RawKernel(_LDPC_MIN_SUM_SHARED_KERNEL_SRC, "ldpc_min_sum_decode_shared")
-    if shared_bytes > 48 * 1024:  # CUDA's default per-block limit -- above this NEEDS the opt-in below
-        try:
-            kernel.max_dynamic_shared_size_bytes = shared_bytes
-        except Exception as exc:
-            raise RuntimeError(
-                f"variant {ldpc.variant!r} needs {shared_bytes} bytes ({shared_bytes/1024:.1f} KB) of "
-                f"per-block shared memory, which this GPU could not provide (underlying error: {exc}). "
-                f"Try a smaller variant instead -- e.g. ldpc_648_* needs only ~21KB, well under every "
-                f"CUDA GPU's default 48KB limit."
-            ) from exc
+    kernel = _get_shared_kernel(shared_bytes)
 
     kernel(
         (n_batch,), (_BLOCK_SIZE,),
         (
             channel_llr,
-            ldpc._check_slot_edges.astype("int64"), check_degree,
-            ldpc._var_slot_edges.astype("int64"), var_degree,
-            ldpc._edge_owner_var.astype("int64"),
+            check_slot_edges_i64, check_degree,
+            var_slot_edges_i64, var_degree,
+            edge_owner_var_i64,
             hard_bits,
             np.int32(ldpc.n), np.int32(ldpc.n_edges), np.int32(ldpc.mb * ldpc.Z),
             np.int32(ldpc.max_check_degree), np.int32(ldpc.max_var_degree),
