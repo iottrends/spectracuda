@@ -86,6 +86,8 @@ Usage (on a real CUDA machine, e.g. Colab with a GPU runtime):
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from spectracuda.backend import cupy_available
@@ -325,5 +327,78 @@ def verify_correctness(variant: str = "ldpc_1944_r12") -> bool:
     return all_ok
 
 
+_SPEED_BATCH_SIZES = [1, 8, 32, 128, 512, 2048]
+_N_ITERS = 10
+_N_WARMUP = 3
+_CPU_BASELINE_MBPS = 9.0  # this project's own measured rs_m8+conv_v27 CPU throughput,
+                           # roughly -- see examples/benchmark_x86_stages_v3.py's own
+                           # session history (typically ~8-11 Mbps) -- printed only as a
+                           # reference point, not re-measured here.
+
+
+def _sync() -> None:
+    import cupy
+
+    cupy.cuda.Stream.null.synchronize()
+
+
+def benchmark_speed(variant: str = "ldpc_1944_r12") -> None:
+    """Only meaningful to run AFTER verify_correctness() has passed --
+    a fast wrong answer is not a result. Same warmup + Stream.null.
+    synchronize() protections as examples/benchmark_ldpc_cuda.py (this
+    project's own established cupy-timing pattern), decoding a CLEAN
+    codeword each call (same "best-case, matches the CPU-side
+    methodology" reasoning documented in benchmark_ldpc_cuda.py's own
+    module docstring)."""
+    if not cupy_available():
+        print("No working CuPy/CUDA runtime detected -- run this on a GPU machine instead.")
+        return
+    import cupy
+
+    array_op_ldpc = LDPCCode(variant, backend="cupy")
+    kernel_ldpc = LDPCCode(variant, backend="cupy")  # separate instance -- no shared mutable state, matches
+                                                       # this project's own "one handle per concurrent user" caution
+    rng = np.random.default_rng(0)
+
+    print(f"\n=== speed: array-op decode() vs fused kernel, variant={variant!r} ===")
+    print(f"{'batch':>7} | {'array-op ms':>12} | {'kernel ms':>10} | {'speedup':>8} | "
+          f"{'array-op Mbps':>13} | {'kernel Mbps':>11}")
+    print("-" * 80)
+    for batch in _SPEED_BATCH_SIZES:
+        msg = rng.integers(0, 2, size=(batch, array_op_ldpc.k)).astype("uint8")
+        encoded = cupy.asarray(array_op_ldpc.encode(msg))
+
+        for _ in range(_N_WARMUP):
+            array_op_ldpc.decode(encoded, p=0.02)
+        _sync()
+        start = time.perf_counter()
+        for _ in range(_N_ITERS):
+            array_op_ldpc.decode(encoded, p=0.02)
+        _sync()
+        array_op_s = (time.perf_counter() - start) / _N_ITERS
+
+        for _ in range(_N_WARMUP):
+            cuda_ldpc_decode(kernel_ldpc, encoded, p=0.02)
+        _sync()
+        start = time.perf_counter()
+        for _ in range(_N_ITERS):
+            cuda_ldpc_decode(kernel_ldpc, encoded, p=0.02)
+        _sync()
+        kernel_s = (time.perf_counter() - start) / _N_ITERS
+
+        total_bits = batch * array_op_ldpc.k
+        print(f"{batch:>7} | {array_op_s*1000:>12.4f} | {kernel_s*1000:>10.4f} | "
+              f"{array_op_s/kernel_s:>7.2f}x | {total_bits/array_op_s/1e6:>13.2f} | "
+              f"{total_bits/kernel_s/1e6:>11.2f}")
+
+    print(f"\nFor reference, this project's own CPU rs_m8+conv_v27 (already-optimized, "
+          f"real measured throughput this whole session): ~{_CPU_BASELINE_MBPS:.0f} Mbps -- "
+          f"that's the number the kernel Mbps column above actually needs to beat, not just "
+          f"the array-op column next to it.")
+
+
 if __name__ == "__main__":
-    verify_correctness()
+    if verify_correctness():
+        benchmark_speed()
+    else:
+        print("\nSkipping speed benchmark -- correctness failed, a fast wrong answer isn't useful.")
