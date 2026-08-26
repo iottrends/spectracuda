@@ -49,6 +49,10 @@ class LSChannelEstimator(Block):
         self.tx_pilots = self.xp.asarray(tx_pilots)
         if self.pilot_indices.shape[0] < 2:
             raise ValueError("need at least 2 pilot subcarriers to interpolate")
+        # Precomputed once here, not on every process() call -- fft_size
+        # never changes after __init__, same class of fix as Modem's own
+        # LUT caching (modem/mapper.py).
+        self._all_bins = self.xp.arange(fft_size)
         self.batch_shape_doc = (
             f"(n_batch, {self.pilot_indices.shape[0]}) complex rx pilots "
             f"in -> (n_batch, {fft_size}) complex channel estimate out"
@@ -59,14 +63,13 @@ class LSChannelEstimator(Block):
         rx_pilots = xp.asarray(rx_pilots)
         h_pilot = rx_pilots / self.tx_pilots  # (n_batch, n_pilot)
 
-        all_bins = xp.arange(self.fft_size)
         n_batch = h_pilot.shape[0]
         h_full = xp.empty((n_batch, self.fft_size), dtype="complex64")
         # Per-batch-item interpolation: xp.interp is 1-D only. n_batch is
         # the outer loop here, not the hot inner path -- the FFT/equalize
         # stages carry the actual batch parallelism.
         for b in range(n_batch):
-            real = xp.interp(all_bins, self.pilot_indices, xp.real(h_pilot[b]))
-            imag = xp.interp(all_bins, self.pilot_indices, xp.imag(h_pilot[b]))
+            real = xp.interp(self._all_bins, self.pilot_indices, xp.real(h_pilot[b]))
+            imag = xp.interp(self._all_bins, self.pilot_indices, xp.imag(h_pilot[b]))
             h_full[b] = real + 1j * imag
         return h_full
