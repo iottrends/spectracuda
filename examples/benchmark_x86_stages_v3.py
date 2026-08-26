@@ -58,11 +58,33 @@ stage-breakdown proportions, and is reconciled against that pristine
 headline total (see "everything else" below) rather than trusted as a
 total in its own right.
 
+CPU affinity pinning: this process pins itself to a single CPU core at
+startup (see _pin_to_one_core()) purely to cut run-to-run measurement
+noise, not for any real-world deployment reason. Verified this actually
+helps, not assumed: on this project's own dev machine (a WSL2 VM on a
+hybrid P/E-core laptop chip), an isolated, sensitive probe (Viterbi
+decode timing) run unpinned had std-dev ~0.45ms across repeated calls;
+pinned to any single core (tried 8 different ones), std-dev dropped to
+~0.06-0.13ms -- a real, ~4-8x tightening, though the specific core
+chosen didn't matter much (no single core was a clear winner). This is
+NOT a full fix for machine noise -- WSL2's guest Linux has no visibility
+into the host's actual physical P/E-core assignment (/proc/cpuinfo
+reports a flat, identical MHz for every logical CPU, and there's no
+/sys/.../cpufreq info at all), so Windows' own hypervisor scheduler can
+still move the pinned *virtual* CPU across different *physical* cores
+underneath us -- pinning only stops OUR OWN process from migrating
+across the 14 virtual CPUs Linux can see, which is still worth doing,
+just not a guarantee of bare-metal-grade determinism. Override the core
+via the SPECTRACUDA_BENCH_PIN_CORE env var (an integer core id, or "off"
+to disable pinning entirely); defaults to core 2.
+
 Usage:
     python examples/benchmark_x86_stages_v3.py
+    SPECTRACUDA_BENCH_PIN_CORE=off python examples/benchmark_x86_stages_v3.py  # to compare
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from collections import defaultdict
@@ -88,6 +110,34 @@ CP_LEN = 32
 SDU_BITS = int(sys.argv[1]) if len(sys.argv) > 1 else 24000  # pass a bit count as argv[1] to override
 N_ROUNDS = 30
 N_WARMUP = 5
+DEFAULT_PIN_CORE = 2
+
+
+def _pin_to_one_core() -> str:
+    """Pin this process to a single CPU core to cut run-to-run
+    measurement noise -- see module docstring for the measured
+    before/after and its caveats (this is a benchmark-only concern, not
+    a real-world deployment technique). Returns a short status string
+    for the printed header; never raises -- a platform without
+    sched_setaffinity (non-Linux), or a requested core id past this
+    machine's actual core count, just leaves affinity untouched and
+    says so, the same "fail silently, this is a transparent nicety, not
+    a user-facing contract" pattern already used for native-backend
+    detection elsewhere in this project."""
+    override = os.environ.get("SPECTRACUDA_BENCH_PIN_CORE")
+    if override is not None and override.strip().lower() == "off":
+        return "disabled (SPECTRACUDA_BENCH_PIN_CORE=off)"
+    if not hasattr(os, "sched_setaffinity"):
+        return "unavailable (no os.sched_setaffinity on this platform)"
+    try:
+        core = int(override) if override is not None else DEFAULT_PIN_CORE
+        available = os.sched_getaffinity(0)
+        if core not in available:
+            return f"skipped (core {core} not in this process's available set {sorted(available)})"
+        os.sched_setaffinity(0, {core})
+        return f"pinned to core {core}"
+    except Exception as exc:  # pragma: no cover -- best-effort, never fatal to the benchmark itself
+        return f"failed ({exc})"
 
 
 def _timed(fn, bucket: str, timings: dict):
@@ -158,6 +208,7 @@ def _install_timing_patch(timings: dict):
 
 
 def run() -> None:
+    pin_status = _pin_to_one_core()
     phy_kwargs = dict(
         fft_size=FFT_SIZE, n_pilot=N_PILOT, n_data=N_DATA, cp_len=CP_LEN,
         modem="qpsk", fec="rs_m8", fec1="conv_v27", crc="crc16",
@@ -175,6 +226,7 @@ def run() -> None:
           f"{'ACTIVE' if _native.native_available() else 'inactive -- pure-Python fallback'}")
     print(f"    Numba CRC backend (transparent, fec/_numba_crc.py): "
           f"{'ACTIVE' if _numba_crc.numba_available() else 'inactive -- pure-Python fallback'}")
+    print(f"    CPU affinity (benchmark-only noise reduction, see module docstring): {pin_status}")
 
     tx_probe_mac = Mac(mode="um", ofdm_kwargs=phy_kwargs)
     tx_probe_mac.bound = True  # never talks to a real peer -- see v1's own module docstring
