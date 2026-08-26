@@ -56,7 +56,8 @@ FFT_SIZE = 256
 N_PILOT = 8
 N_DATA = 216
 CP_LEN = 32
-SDU_BITS = 4000
+#SDU_BITS = 4000
+SDU_BITS = 24000
 N_ROUNDS = 30
 N_WARMUP = 5
 
@@ -151,13 +152,13 @@ def _instrument(mac: Mac, timings: dict) -> None:
 def run() -> None:
     phy_kwargs = dict(
         fft_size=FFT_SIZE, n_pilot=N_PILOT, n_data=N_DATA, cp_len=CP_LEN,
-        modem="qpsk", fec="rs_m8", fec1="conv_v27", crc="crc16",
+        modem="qam16", fec="rs_m8", fec1="conv_v27", crc="crc16",
         sync="schmidl_cox", cfo="schmidl_cox",
         channel_estimator="ls", equalizer="mmse",
         backend="numpy",
     )
     print(f"=== config: fft_size={FFT_SIZE}, n_pilot={N_PILOT}, n_data={N_DATA}, "
-          f"cp_len={CP_LEN}, modem=qpsk, fec='rs_m8' (inner), "
+          f"cp_len={CP_LEN}, modem=16qam, fec='rs_m8' (inner), "
           f"fec1='conv_v27' (outer), crc=crc16, sync=schmidl_cox, "
           f"cfo=schmidl_cox, channel_estimator=ls, equalizer=mmse, "
           f"backend=numpy, sdu_bits={SDU_BITS} ===")
