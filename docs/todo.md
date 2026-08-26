@@ -850,3 +850,119 @@ explicitly requested, same footing as LDPC's "added anyway" framing).
   long-frame-reliability gap at the SNRs used elsewhere — worked around
   with a higher demo SNR, not a fix for §1.11 itself). Full suite: 592
   passed, 1 pre-existing unrelated skip.
+
+---
+
+## Part 4 — Real-time performance (x86, single-core, 20 Msps budget)
+
+Target: one frame's worth of TX (`send_iq()`) and RX (`receive_iq()`)
+work, single-threaded, one frame at a time, each within the ~1.8848ms
+budget a 20 Msps sample rate implies for this project's benchmark config
+(`fft_size=256`, `rs_m8`+`conv_v27`, qpsk, UM — see
+`examples/benchmark_x86_stages_v3.py`). Not liquid-dsp-parity work; this
+section tracks the drone-link-demo hardware target instead.
+
+**2026-08-26**: TX now consistently lands under budget (~0.6-0.9ms/frame
+on this dev machine); RX has come down from an untuned ~16.3ms/frame to
+a *reliably reproduced* ~2.2-2.5ms/frame (~16 Msps, ~0.79x of the 20
+Msps target) — the closest and most STABLE this project has gotten to
+the budget so far (previously: correct in isolated runs, but anywhere
+from 4ms to 16ms depending on machine noise, not a number you could
+actually plan around). Landed via (see git history on
+`perf/native-fec-and-ofdm-batching` for the individual commits):
+  - Cutting real, measured per-frame redundant work: `SchmidlCoxCFO.correct()`'s
+    complex `exp()` swapped for `cos()+j*sin()` in float32 (~3x on that
+    stage); `Modem`'s bit-weight/shift LUTs and `LSChannelEstimator`'s
+    subcarrier-index array precomputed once in `__init__` instead of every
+    `process()` call; `Ofdm._build_header_symbols()`'s `setdiff1d` and
+    `Ofdm._decode_header_from_sync()`'s per-frame throwaway
+    `Modem`/`Packetizer` reconstruction (a fresh native Viterbi trellis +
+    RS GF(256) table via ctypes, EVERY frame) both cached.
+  - `SchmidlCoxSync.process()`: `b1`/`b2` (two separate `abs()**2` + cumsum
+    passes) recognized as overlapping slices of one energy array,
+    collapsed to one `abs()**2` + one cumsum + slicing/offset-subtraction
+    (~20% faster on that stage, verified bit-exact `start_index`).
+  - A new, optional SSE4.1-accelerated native Viterbi decode path
+    (`fec/_native.py`'s `NativeConvolutionalSSE`, x86-only, gated on a
+    RUNTIME `/proc/cpuinfo` check — not just compile-time — before ever
+    loading the compiled `.so`, since running an SSE4.1 instruction on a
+    CPU that lacks one is an uncatchable SIGILL, not a Python exception;
+    ARM/Jetson, the real deployment target, always falls through to the
+    existing portable native path unchanged). Cut real Viterbi decode
+    time on this dev machine from a highly-variable 3.1-6.5ms down to a
+    consistent ~2.5ms.
+  - Benchmark-script trustworthiness fixes, not library changes: v3's own
+    stage-by-stage breakdown used to come from cProfile, which was found
+    (by directly tracing a real discrepancy, not assumed) to
+    disproportionately inflate whichever stage is built from the most
+    small nested calls — Reed-Solomon decode (~21 small calls/frame)
+    measured ~3x too high under cProfile alone, while a plain stopwatch
+    wrapped around the same real calls (still `spectracuda`'s own
+    production methods, never a swapped-in binding, unlike v1/v2's
+    approach) consistently agreed with an isolated, out-of-pipeline
+    timing of the identical call. v3 now uses that stopwatch technique
+    for its stage breakdown; the headline TX/RX ms/frame numbers
+    themselves were always measured on a completely uninstrumented pass
+    and were never wrong.
+  - Pinning the benchmark process to one CPU core
+    (`SPECTRACUDA_BENCH_PIN_CORE`, default core 2) to cut run-to-run
+    noise on this dev machine (a WSL2 VM on a hybrid P/E-core laptop
+    chip with no real host-level core-affinity guarantee available from
+    inside the guest) — an isolated probe's std-dev dropped ~4-8x when
+    pinned to any single core.
+
+  Investigated and deliberately NOT pursued (see PR discussion for the
+  numbers): further chunking the outer Viterbi codeword into independent
+  blocks decoded in parallel threads (gave ~1.75x on the portable decode
+  path, only ~1.3x on top of the SSE4.1 path before degrading past 2
+  chunks — not worth the wire-format coordination cost); threading
+  Reed-Solomon's already-block-chunked decode (actively CRASHED when
+  threads shared one native handle, and was ~5.5x SLOWER even done
+  correctly with one handle per thread and a persistent pool — RS
+  blocks are ~26us of real work each, far below Python's own per-task
+  threading overhead floor).
+
+  Representative result (32000-bit SDU, 2 PDUs/frame, straight from
+  `Mac.send_iq()`/`receive_iq()` -- the plain-timed headline numbers,
+  with ZERO monkey-patching anywhere, not even the stopwatch-wrapped
+  stage breakdown that runs alongside it -- `examples/
+  benchmark_x86_stages_v3.py 32000`, pinned to core 2; a near-identical
+  ~16 Msps RX figure was also seen the day before this entry, i.e. this
+  reproduces run over run, not a single lucky sample):
+  ```
+  full TX chain (send_iq(), 2 PDU(s)/SDU): 1.3152 ms/SDU (0.6576 ms/frame)
+  RX stage breakdown (stopwatch pass -- proportions, averaged over 60 frames):
+                                     sync detect + CFO: 0.4733 ms
+                            OFDM decode (FFT+CP strip): 0.2349 ms
+                     channel estimation + equalization: 0.1332 ms
+                   FEC decode -- Viterbi (fec1, outer): 0.5886 ms
+              FEC decode -- Reed-Solomon (fec0, inner): 0.1222 ms
+                                            MAC decode: 0.0159 ms
+    everything else (unbucketed -- header/resource-grid/reassembly/etc.): 0.8176 ms
+
+  === Throughput (single-threaded, one frame at a time) ===
+    TX: 0.6576 ms/frame -> ~36.56 Mbps -> ~57.32 Msps (OK of 20 Msps, budget 1.8848 ms)
+    RX: 2.3858 ms/frame -> ~10.08 Mbps -> ~15.80 Msps (0.79x short of 20 Msps, budget 1.8848 ms)
+    (bottleneck: RX)
+  ```
+
+- [ ] **Next up: the "unbucketed" RX time is now the single largest line
+  item** (~0.7-0.9ms above, bigger than any one of Viterbi/sync/RS/FFT/
+  channel-est individually) -- it covers header decode, resource-grid
+  extraction/scatter, reassembly, and general packetizer glue, none of
+  which have been profiled directly yet. Worth checking for the same
+  class of "recompute a per-instance constant every call" bug already
+  found and fixed three separate times above (CFO, Modem, LSChannelEstimator)
+  before assuming it's irreducible real work.
+- [ ] RX is still ~1.3x over the 1.8848ms budget even at this improved,
+  now-reproducible level -- Viterbi decode (~0.55-0.59ms) and sync+CFO
+  (~0.44-0.56ms) are both already at their measured single-core-x86
+  floor (see the "deliberately NOT pursued" note above for why threading
+  either further doesn't help on this hardware). Closing the remaining
+  gap most likely needs either accepting this as the realistic single-
+  frame-latency floor and pipelining multiple frames' decode across
+  cores for sustained THROUGHPUT instead (a different lever than
+  anything tried so far -- not yet attempted), or validating directly on
+  the real Jetson target, where core count/topology/thermals (and
+  possibly a genuine host-level CPU-affinity guarantee, unlike this
+  WSL2 dev machine) are completely different from this laptop.
