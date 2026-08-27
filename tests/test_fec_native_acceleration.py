@@ -25,6 +25,7 @@ from spectracuda.fec.viterbi import ConvolutionalCode
 
 _NATIVE_OK = _native.native_available()
 _NUMBA_OK = _numba_crc.numba_available()
+_NEON_OK = _native.neon_available()
 
 
 # --- Viterbi: native backend, now fixed and active --------------------
@@ -97,6 +98,76 @@ def test_convolutional_code_correctness_regardless_of_backend_state():
         enc = c.encode(msg)
         dec = c.decode(enc)
         np.testing.assert_array_equal(dec, msg)
+
+
+# --- Viterbi: ARM NEON backend, when available -------------------------
+# Only ever runs for real on aarch64/arm64 (see fec/_native.py's
+# neon_available() docstring) -- this is the FIRST time this path has
+# been exercised against real ARM hardware; nothing above this comment
+# proves anything about NEON specifically, since sse_available() wins
+# the dispatch on any x86 box this suite also runs on (see viterbi.py's
+# ConvolutionalCode.__init__).
+
+@pytest.mark.skipif(not _NEON_OK, reason="not an aarch64/arm64 machine, or NEON compile failed -- inactive here")
+def test_convolutional_code_neon_backend_is_active():
+    """On a real ARM machine (a Raspberry Pi 5, a Jetson's ARM cores),
+    this must actually be what gets selected -- not silently falling
+    back to the portable path (which would mean neon_available() lied,
+    or ConvolutionalCode's dispatch order in viterbi.py is wrong)."""
+    from spectracuda.fec._native import NativeConvolutionalNEON
+
+    c = ConvolutionalCode(backend="numpy")
+    assert isinstance(c._native, NativeConvolutionalNEON)
+
+
+@pytest.mark.skipif(not _NEON_OK, reason="not an aarch64/arm64 machine, or NEON compile failed -- inactive here")
+@pytest.mark.parametrize("k", [1, 6, 39, 100, 194, 4001, 4002, 4006, 24032])
+def test_convolutional_code_neon_correctness_every_t_mod_8_residue(k):
+    """Same sweep as test_convolutional_code_correctness_every_t_mod_8_
+    residue above, run explicitly against the NEON backend specifically
+    (not just whichever backend happens to be active) -- the real
+    correctness gate this path needs before any speed number from it is
+    trusted (see fec/_native_src/libcorrect/src/convolutional/neon/
+    decode.c's own module comment)."""
+    from spectracuda.fec._native import NativeConvolutionalNEON
+
+    c = ConvolutionalCode(backend="numpy")
+    c._native = NativeConvolutionalNEON()
+    rng = np.random.default_rng(hash(k) % (2**31))
+    msg = rng.integers(0, 2, size=(1, k)).astype("uint8")
+    enc = c.encode(msg)
+    dec = c.decode(enc)
+    np.testing.assert_array_equal(dec, msg)
+
+
+@pytest.mark.skipif(not _NEON_OK, reason="not an aarch64/arm64 machine, or NEON compile failed -- inactive here")
+@pytest.mark.parametrize("k", [1, 39, 194, 4002, 4006])
+@pytest.mark.parametrize("n_errors", [0, 1, 3, 5])
+def test_convolutional_code_neon_error_correction_matches_pure_python(k, n_errors):
+    """NEON decode of a REAL bit-error-corrupted codeword must match the
+    pure-Python path's own answer exactly -- same rationale as the SSE-
+    era test_convolutional_code_error_correction_matches_pure_python
+    above: proves this holds under error correction, not just clean
+    round-trips."""
+    from spectracuda.fec._native import NativeConvolutionalNEON
+
+    pure_bits = ConvolutionalCode.__new__(ConvolutionalCode)
+    ConvolutionalCode.__init__(pure_bits, backend="numpy")
+    pure_bits._native = None  # force the pure-Python path as ground truth
+
+    rng = np.random.default_rng(hash((k, n_errors)) % (2**31))
+    msg = rng.integers(0, 2, size=(1, k)).astype("uint8")
+    enc = pure_bits.encode(msg)
+    corrupted = enc.copy()
+    if n_errors:
+        idx = rng.choice(enc.shape[-1], size=n_errors, replace=False)
+        corrupted[0, idx] ^= 1
+
+    expected = pure_bits.decode(corrupted)
+    c = ConvolutionalCode(backend="numpy")
+    c._native = NativeConvolutionalNEON()
+    actual = c.decode(corrupted)
+    np.testing.assert_array_equal(actual, expected)
 
 
 # --- Reed-Solomon: native backend, when available ---------------------

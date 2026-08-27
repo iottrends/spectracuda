@@ -11,14 +11,21 @@ steps, each individually cheap" shape Numba/native-C compilation fixes
 well. Measured (x86, one full-length message/codeword): Viterbi decode
 38.6ms -> 1.78ms (portable C, ~22x), Reed-Solomon decode (16 symbol
 errors, worst case) 4.0ms -> 0.03ms (portable C, ~130x). An SSE4.1-
-accelerated build of the SAME algorithm measured a further ~2.5x on
-Viterbi specifically, but that path is x86-only (no ARM/NEON equivalent
-ships in libcorrect for this code) -- deliberately NOT vendored here,
-since this project's target deployment (Jetson, ARM) would silently get
-zero benefit from it while adding real cross-platform-build risk to the
-one thing that must "run anywhere" (see docs/architecture.md's backend-
-abstraction principle, the same reasoning that keeps backend="cupy"
-strictly optional-with-fallback, never assumed).
+accelerated build of the SAME algorithm (see sse_available()/
+NativeConvolutionalSSE below) measured a further ~2.5x on Viterbi
+specifically, gated to x86_64 CPUs with runtime-verified SSE4.1 support
+-- no ARM/NEON equivalent ships in upstream libcorrect for this code,
+so ARM boxes (a Jetson, or a Raspberry Pi 5 -- see docs/todo.md) used to
+fall all the way back to the portable path with none of that further
+speedup. A from-scratch NEON port (see neon_available()/
+NativeConvolutionalNEON below) closes most of that gap now -- NOT
+vendored from upstream (no NEON build exists there), written for
+spectracuda specifically, reusing the portable build's own
+pair_lookup_t/history_buffer machinery unchanged and replacing only the
+add-compare-select inner loop (see src/convolutional/neon/decode.c's
+own module comment for its deliberately conservative scope, and
+neon_available()'s own docstring for what has/hasn't been verified on
+real ARM hardware yet).
 
 Activation is FULLY AUTOMATIC and TRANSPARENT, not a new constructor
 argument or config flag: ConvolutionalCode/ReedSolomonCode's public API
@@ -81,6 +88,27 @@ _C_FILES = _CONV_C_FILES + [
 _SSE_SRC_DIR = os.path.join(_SRC_DIR, "src", "convolutional", "sse")
 _SSE_C_FILES = _CONV_C_FILES + [
     os.path.join(_SSE_SRC_DIR, f) for f in ("lookup.c", "convolutional.c", "encode.c", "decode.c")
+]
+
+# ARM NEON-accelerated Viterbi decode -- the ARM counterpart to the SSE
+# path above, for machines (e.g. a Raspberry Pi 5) that get NONE of that
+# x86-only speedup (see sse_available()'s own docstring: SSE4.1 doesn't
+# exist on ARM at all, so those machines fall all the way back to the
+# portable build otherwise). Unlike the SSE files, NOT vendored from
+# upstream libcorrect -- no NEON build exists there (confirmed, see
+# fec/_native_src/libcorrect/include/correct-neon.h's own header
+# comment) -- this is original code written for spectracuda, reusing
+# the portable build's own pair_lookup_t/history_buffer machinery
+# unchanged and replacing only the add-compare-select inner loop (see
+# src/convolutional/neon/decode.c's own module comment for the
+# deliberately conservative scope of that port -- correctness-verified
+# by the same sweep the SSE promotion required, see
+# tests/test_fec_native_acceleration.py; NOT yet measured on real ARM
+# hardware by the person promoting this comment, only by whoever ran
+# that correctness sweep on one -- see neon_available()'s own docstring).
+_NEON_SRC_DIR = os.path.join(_SRC_DIR, "src", "convolutional", "neon")
+_NEON_C_FILES = _CONV_C_FILES + [
+    os.path.join(_NEON_SRC_DIR, f) for f in ("convolutional.c", "encode.c", "decode.c")
 ]
 
 _G1 = 0o171  # spectracuda's own conv_v27 polynomials (viterbi.py) -- verified interop
@@ -320,6 +348,113 @@ def sse_available() -> bool:
     return _sse_lib is not None
 
 
+_neon_lock = threading.Lock()
+_neon_checked = False
+_neon_lib: Optional[ctypes.CDLL] = None
+
+
+def _neon_source_hash() -> str:
+    h = hashlib.sha256()
+    for path in sorted(_NEON_C_FILES) + [
+        os.path.join(_INCLUDE_DIR, "correct.h"),
+        os.path.join(_INCLUDE_DIR, "correct-neon.h"),
+    ]:
+        with open(path, "rb") as f:
+            h.update(f.read())
+    h.update(sys.platform.encode())
+    # Same reasoning as _sse_source_hash(): must include the machine
+    # architecture, not just sys.platform, so a cache dir shared across
+    # machines (e.g. SPECTRACUDA_CACHE_DIR on a shared filesystem) can
+    # never hand an x86_64-compiled .so to an ARM process or vice versa.
+    # Less immediately dangerous here than the SSE case (NEON intrinsics
+    # simply fail to COMPILE on a non-ARM target -- no SIGILL risk from
+    # a stale cross-arch .so slipping past a load, since compilation
+    # itself is architecture-specific and happens fresh per machine
+    # unless the cache dir is literally shared across differing
+    # hardware), but kept disjoint anyway for the same "never collide on
+    # filename" reason _sse_source_hash() gives.
+    h.update(platform.machine().encode())
+    return h.hexdigest()[:16]
+
+
+def _compile_neon(so_path: str) -> None:
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if cc is None:
+        raise RuntimeError("no C compiler (cc/gcc/clang) found")
+    # No -mfpu/-march flag needed: NEON/ASIMD is a MANDATORY part of the
+    # AArch64 base ISA (unlike x86_64's optional SSE4.1, which needs
+    # both an explicit -msse4.1 compile flag AND _cpu_supports_sse41()'s
+    # own runtime check below) -- any aarch64 C compiler already targets
+    # it by default, and neon_available()'s platform.machine() gate
+    # below is the only gate this needs.
+    cmd = [cc, "-O2", "-fPIC", "-std=c99", "-I", _INCLUDE_DIR, "-shared", "-o", so_path] + _NEON_C_FILES + ["-lm"]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(f"native NEON FEC backend compile failed: {result.stderr[-2000:]}")
+
+
+def _bind_neon_signatures(lib: ctypes.CDLL) -> None:
+    lib.correct_convolutional_neon_create.restype = ctypes.c_void_p
+    lib.correct_convolutional_neon_create.argtypes = [ctypes.c_size_t, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint16)]
+    lib.correct_convolutional_neon_destroy.argtypes = [ctypes.c_void_p]
+    lib.correct_convolutional_neon_encode_len.restype = ctypes.c_size_t
+    lib.correct_convolutional_neon_encode_len.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.correct_convolutional_neon_encode.restype = ctypes.c_size_t
+    lib.correct_convolutional_neon_encode.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint8)
+    ]
+    lib.correct_convolutional_neon_decode.restype = ctypes.c_ssize_t
+    lib.correct_convolutional_neon_decode.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint8)
+    ]
+
+
+def neon_available() -> bool:
+    """True if the ARM NEON-accelerated Viterbi decode path is compiled
+    and loaded. Checked once per process, cached -- same rationale as
+    native_available()/sse_available().
+
+    Gated on ONE condition, unlike sse_available()'s two: platform.
+    machine() says aarch64/arm64. No runtime feature-check equivalent to
+    _cpu_supports_sse41() is needed here -- NEON/ASIMD is a MANDATORY
+    part of the AArch64 base architecture (every AArch64 CPU has it,
+    unlike x86_64's genuinely optional SSE4.1), so the machine-type
+    check alone is sufficient and can't produce a false positive the way
+    a bare platform.machine()=="x86_64" check would for SSE4.1.
+
+    NOT YET RUN ON REAL ARM HARDWARE by whoever wrote this gate (see
+    src/convolutional/neon/decode.c's own module comment) -- this
+    compiles and the correctness sweep must pass on an actual Pi 5 (or
+    other aarch64 box) before any speed claim from this path is trusted,
+    same discipline the SSE promotion required before IT was trusted.
+
+    Fully independent of native_available()/sse_available(): a separate
+    .so from a disjoint hash (_neon_source_hash()), same "fails silently
+    and permanently back to native_available()'s portable path" contract
+    for every other failure mode (no compiler, compile error, etc.)."""
+    global _neon_checked, _neon_lib
+    if _neon_checked:
+        return _neon_lib is not None
+    with _neon_lock:
+        if _neon_checked:
+            return _neon_lib is not None
+        _neon_checked = True
+        if platform.machine() not in ("aarch64", "arm64"):
+            return False
+        try:
+            so_path = os.path.join(_cache_dir(), f"libcorrect_neon_{_neon_source_hash()}.so")
+            if not os.path.exists(so_path):
+                tmp_path = so_path + f".tmp{os.getpid()}"
+                _compile_neon(tmp_path)
+                os.replace(tmp_path, so_path)  # atomic -- same race-avoidance as native_available()
+            lib = ctypes.CDLL(so_path)
+            _bind_neon_signatures(lib)
+            _neon_lib = lib
+        except Exception:
+            _neon_lib = None
+    return _neon_lib is not None
+
+
 class NativeConvolutional:
     """Drop-in accelerated backend for ConvolutionalCode's encode()/
     decode() -- exact same batch-shape contract. Persistent
@@ -449,6 +584,62 @@ class NativeConvolutionalSSE:
         encoded_bytes = np.packbits(padded_bits)
         msg_out = (ctypes.c_uint8 * (Tp // 8 + 8))()
         n_written = _sse_lib.correct_convolutional_sse_decode(self._conv, encoded_bytes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), 2 * Tp, msg_out)
+        decoded = np.unpackbits(np.frombuffer(bytes(msg_out[: max(n_written, 0)]), dtype="uint8"))
+        return decoded[:k]
+
+    def encode(self, bits: np.ndarray) -> np.ndarray:
+        bits = np.asarray(bits, dtype="uint8")
+        return np.stack([self._encode_one(bits[b]) for b in range(bits.shape[0])])
+
+    def decode(self, bits: np.ndarray) -> np.ndarray:
+        bits = np.asarray(bits, dtype="uint8")
+        return np.stack([self._decode_one(bits[b]) for b in range(bits.shape[0])])
+
+
+class NativeConvolutionalNEON:
+    """ARM NEON-accelerated drop-in for ConvolutionalCode's encode()/
+    decode() -- the ARM counterpart to NativeConvolutionalSSE above, for
+    machines that gate False on sse_available() (see neon_available()'s
+    own docstring). Same batch-shape contract, same _DECODE_PAD_PAIRS
+    decode-side workaround (the withheld-bits quirk lives in the shared
+    portable warmup()/tail()/history_buffer machinery this class reuses
+    unchanged -- see src/convolutional/neon/decode.c's own comment --
+    not in anything NEON-specific, so it applies here identically).
+
+    encode() has no separate speed claim here, same reasoning as
+    NativeConvolutionalSSE's own docstring: just calls straight through
+    to the identical portable correct_convolutional_encode() under the
+    hood (src/convolutional/neon/encode.c)."""
+
+    def __init__(self) -> None:
+        if not neon_available():
+            raise RuntimeError("native NEON FEC backend is not available")
+        poly = (ctypes.c_uint16 * 2)(_G1, _G2)
+        self._conv = _neon_lib.correct_convolutional_neon_create(2, 7, poly)
+        if not self._conv:
+            raise RuntimeError("correct_convolutional_neon_create failed")
+
+    def _encode_one(self, msg_bits: np.ndarray) -> np.ndarray:
+        k = len(msg_bits)
+        padded = np.concatenate([msg_bits, np.zeros(_TAIL_BITS, dtype="uint8")])
+        msg_bytes = np.packbits(padded)
+        enc_len_bits = _neon_lib.correct_convolutional_neon_encode_len(self._conv, len(msg_bytes))
+        encoded = (ctypes.c_uint8 * (enc_len_bits // 8 + 8))()
+        _neon_lib.correct_convolutional_neon_encode(self._conv, msg_bytes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), len(msg_bytes), encoded)
+        want_bits = 2 * (k + _TAIL_BITS)
+        encoded_bytes = np.frombuffer(bytes(encoded[: want_bits // 8 + 1]), dtype="uint8")
+        return np.unpackbits(encoded_bytes)[:want_bits]
+
+    def _decode_one(self, encoded_bits: np.ndarray) -> np.ndarray:
+        # See NativeConvolutional._decode_one's own docstring for the
+        # full withheld-bits story -- identical fix, identical margin.
+        T = len(encoded_bits) // 2
+        k = T - _TAIL_BITS
+        padded_bits = np.concatenate([encoded_bits, np.zeros(2 * _DECODE_PAD_PAIRS, dtype="uint8")])
+        Tp = T + _DECODE_PAD_PAIRS
+        encoded_bytes = np.packbits(padded_bits)
+        msg_out = (ctypes.c_uint8 * (Tp // 8 + 8))()
+        n_written = _neon_lib.correct_convolutional_neon_decode(self._conv, encoded_bytes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), 2 * Tp, msg_out)
         decoded = np.unpackbits(np.frombuffer(bytes(msg_out[: max(n_written, 0)]), dtype="uint8"))
         return decoded[:k]
 
