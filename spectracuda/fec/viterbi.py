@@ -42,10 +42,8 @@ import numpy as np
 from ..block import Block
 from ._native import (
     NativeConvolutional,
-    NativeConvolutionalNEON,
     NativeConvolutionalSSE,
     native_available,
-    neon_available,
     sse_available,
 )
 
@@ -101,18 +99,25 @@ class ConvolutionalCode(Block):
         # trigger it -- re-verified across 210 message sizes (every
         # T-mod-8 residue) plus real bit-error injection against the
         # pure-Python path as ground truth before re-enabling here.
-        # Prefer whichever SIMD-accelerated native decode path this
-        # machine's architecture actually supports over the plain
-        # portable one -- sse_available() (x86_64-and-runtime-cpuid
-        # gated) and neon_available() (aarch64/arm64 gated) are mutually
-        # exclusive by construction (see each one's own docstring), so
-        # the order between these first two branches doesn't matter;
-        # either declining falls through to the portable native path
-        # exactly as before.
+        # SSE4.1 measured genuinely faster than the portable build (see
+        # _native.py's own docstring) -- prefer it when available.
+        #
+        # NEON did NOT: measured on real Pi 5 hardware (2026-08-27),
+        # this first NEON kernel's Viterbi decode was ~2.1x SLOWER than
+        # the plain portable build (7.92ms vs 3.72ms for the same
+        # ~24000-bit PDU) -- correct (30/30 correctness tests pass
+        # bit-exact) but a real regression, not a speedup, almost
+        # certainly because gathering table lookups through small stack
+        # scalar arrays before/after each 4-lane vector op adds more
+        # memory round-tripping than the ALU parallelism buys back at
+        # this width. So, UNLIKE sse_available(), neon_available() is
+        # deliberately NOT consulted here until a NEON kernel actually
+        # beats the portable build on real hardware -- unused for now
+        # (kept, and still exercised by tests/test_fec_native_
+        # acceleration.py's neon-specific tests, in case a future,
+        # wider/less memory-bound kernel replaces this one).
         if self.backend == "numpy" and sse_available():
             self._native = NativeConvolutionalSSE()
-        elif self.backend == "numpy" and neon_available():
-            self._native = NativeConvolutionalNEON()
         elif self.backend == "numpy" and native_available():
             self._native = NativeConvolutional()
         else:

@@ -14,18 +14,26 @@ errors, worst case) 4.0ms -> 0.03ms (portable C, ~130x). An SSE4.1-
 accelerated build of the SAME algorithm (see sse_available()/
 NativeConvolutionalSSE below) measured a further ~2.5x on Viterbi
 specifically, gated to x86_64 CPUs with runtime-verified SSE4.1 support
--- no ARM/NEON equivalent ships in upstream libcorrect for this code,
-so ARM boxes (a Jetson, or a Raspberry Pi 5 -- see docs/todo.md) used to
-fall all the way back to the portable path with none of that further
-speedup. A from-scratch NEON port (see neon_available()/
-NativeConvolutionalNEON below) closes most of that gap now -- NOT
-vendored from upstream (no NEON build exists there), written for
-spectracuda specifically, reusing the portable build's own
-pair_lookup_t/history_buffer machinery unchanged and replacing only the
-add-compare-select inner loop (see src/convolutional/neon/decode.c's
-own module comment for its deliberately conservative scope, and
-neon_available()'s own docstring for what has/hasn't been verified on
-real ARM hardware yet).
+-- no ARM/NEON equivalent ships in upstream libcorrect for this code, so
+ARM boxes (a Jetson, or a Raspberry Pi 5 -- see docs/todo.md) fall all
+the way back to the portable path with none of that further speedup. A
+from-scratch NEON port was attempted (see neon_available()/
+NativeConvolutionalNEON below) -- NOT vendored from upstream (no NEON
+build exists there), written for spectracuda specifically, reusing the
+portable build's own pair_lookup_t/history_buffer machinery unchanged
+and replacing only the add-compare-select inner loop (see
+src/convolutional/neon/decode.c's own module comment for its
+deliberately conservative scope). It is CORRECT (bit-exact, verified on
+real Pi 5 hardware, see tests/test_fec_native_acceleration.py's
+neon-specific tests) but, measured on that same hardware (2026-08-27),
+~2.1x SLOWER than the plain portable build (7.92ms vs 3.72ms Viterbi
+decode for a ~24000-bit PDU) -- almost certainly because gathering
+table lookups through small stack scalar arrays around each 4-lane
+vector op adds more memory round-tripping than the ALU parallelism buys
+back at this width. So viterbi.py's dispatch deliberately does NOT
+prefer it over the portable build (see its own comment) -- it is kept,
+compiled, and tested, but not used, pending a wider/less memory-bound
+kernel actually beating the portable build for real.
 
 Activation is FULLY AUTOMATIC and TRANSPARENT, not a new constructor
 argument or config flag: ConvolutionalCode/ReedSolomonCode's public API
