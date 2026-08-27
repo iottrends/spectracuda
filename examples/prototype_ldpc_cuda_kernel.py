@@ -17,7 +17,7 @@ not a single happy-path check).
 fec/ldpc.py's decode() is a plain array-op implementation: 50 belief-
 propagation iterations, each doing ~8 separate xp (numpy/cupy) calls.
 On cupy that's ~400 separate GPU kernel launches per decode() call --
-examples/benchmark_x86_stages_v4.py and examples/benchmark_ldpc_cuda.py
+examples/benchmark_x86_stages_ldpc.py and examples/benchmark_ldpc_cuda.py
 both measured this costing 200-800ms on CPU and still ~25-30x SLOWER
 in absolute throughput than this project's already-optimized CPU
 rs_m8+conv_v27, even with a real ~10x cupy-over-numpy speedup. Reading

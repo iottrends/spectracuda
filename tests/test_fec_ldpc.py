@@ -134,15 +134,57 @@ def test_clean_round_trip_and_zero_syndrome(variant):
 
 
 def test_wrong_message_length_raises():
+    """10 used to be the "wrong length" example here -- it no longer is:
+    shortened LDPC (see ldpc.py's encode()/decode() docstrings, same
+    technique as ReedSolomonCode's own shortened-block support) now
+    accepts any 1..k, so the genuinely out-of-range boundary moved to 0
+    and >k."""
     code = LDPCCode("ldpc_648_r12", backend="numpy")
     with pytest.raises(ValueError):
-        code.encode(np.zeros((1, 10), dtype="uint8"))
+        code.encode(np.zeros((1, 0), dtype="uint8"))
+    with pytest.raises(ValueError):
+        code.encode(np.zeros((1, code.k + 1), dtype="uint8"))
 
 
 def test_wrong_codeword_length_raises():
+    """Same shift as above -- a decode() length is only invalid now if
+    the implied real_k (length - n_checks) falls outside 1..k."""
     code = LDPCCode("ldpc_648_r12", backend="numpy")
+    n_checks = code.n - code.k
     with pytest.raises(ValueError):
-        code.decode(np.zeros((1, 10), dtype="uint8"))
+        code.decode(np.zeros((1, n_checks), dtype="uint8"))  # real_k would be 0
+    with pytest.raises(ValueError):
+        code.decode(np.zeros((1, code.n + 1), dtype="uint8"))  # real_k would be k+1
+
+
+def test_shortened_round_trip_various_lengths():
+    """The actual new behavior: a message genuinely shorter than k
+    round-trips, and the transmitted codeword is real_k + n_checks --
+    NOT padded up to the full n, which is the entire point (see
+    docs/mac.md's writeup of the identical rs_m8 bug this mirrors)."""
+    code = LDPCCode("ldpc_648_r12", backend="numpy")
+    n_checks = code.n - code.k
+    rng = np.random.default_rng(3)
+    for real_k in (1, 13, 104, code.k // 2, code.k - 1, code.k):
+        msg = rng.integers(0, 2, size=(2, real_k)).astype("uint8")
+        codeword = code.encode(msg)
+        assert codeword.shape[-1] == real_k + n_checks
+        np.testing.assert_array_equal(code.decode(codeword), msg)
+
+
+def test_shortened_still_corrects_injected_errors():
+    """Real error-correction (BP convergence) isn't broken by
+    shortening -- proven with real injected bit flips, not assumed from
+    the clean encode/decode round trip alone."""
+    code = LDPCCode("ldpc_648_r12", backend="numpy")
+    rng = np.random.default_rng(4)
+    real_k = 104  # e.g. Mac's own bind-request PDU size
+    msg = rng.integers(0, 2, size=(1, real_k)).astype("uint8")
+    codeword = code.encode(msg)
+    corrupted = codeword.copy()
+    flip_idx = rng.choice(codeword.shape[-1], size=3, replace=False)
+    corrupted[0, flip_idx] ^= 1
+    np.testing.assert_array_equal(code.decode(corrupted, p=0.02), msg)
 
 
 def test_process_is_alias_for_encode():
@@ -247,8 +289,14 @@ def test_fec_dispatcher_forwards_decode_kwargs():
 
 
 def test_fec_dispatcher_encoded_decoded_length_helpers():
+    """100 used to be the "not a multiple of k_bits" error example here
+    -- it no longer is: FEC.encoded_length()/decoded_length() now
+    support LDPC's own shortened-codeword leftover block, same as they
+    already did for rs_m8 (see fec.py's encoded_length() docstring)."""
     fec = FEC("ldpc_648_r12", backend="numpy")
     assert fec.encoded_length(324) == 648
     assert fec.decoded_length(648) == 324
-    with pytest.raises(ValueError):
-        fec.encoded_length(100)  # not a multiple of k_bits
+    n_checks = fec.n_bits - fec.k_bits
+    assert fec.encoded_length(100) == 100 + n_checks  # shortened leftover, no full blocks
+    assert fec.decoded_length(100 + n_checks) == 100
+    assert fec.accepts_partial_block is True

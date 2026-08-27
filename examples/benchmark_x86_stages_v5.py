@@ -1,4 +1,4 @@
-"""v5 of benchmark_x86_stages_v4.py: LDPC decode via the validated CUDA
+"""v5 of benchmark_x86_stages_ldpc.py: LDPC decode via the validated CUDA
 kernel (examples/prototype_ldpc_cuda_kernel.py), on a real GPU, through
 the FULL Ofdm pipeline -- not just the isolated FEC-stage Mbps numbers
 prototype_ldpc_cuda_kernel.py's own benchmark_speed() already measured.

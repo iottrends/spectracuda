@@ -1,4 +1,5 @@
-"""v4 of benchmark_x86_stages_v3.py: LDPC instead of rs_m8+conv_v27.
+"""benchmark_x86_stages_ldpc.py (formerly v4 of benchmark_x86_stages_v3.py):
+LDPC instead of rs_m8+conv_v27.
 
 Same real question v3 answers for the two-stage rs_m8(inner)+conv_v27
 (outer) FEC this project's drone-link-demo scope requires -- how close
@@ -44,11 +45,11 @@ own. Same CPU-core-pinning noise reduction as v3
 (SPECTRACUDA_BENCH_PIN_CORE).
 
 Usage:
-    python examples/benchmark_x86_stages_v4.py
-    python examples/benchmark_x86_stages_v4.py 32000
-    python examples/benchmark_x86_stages_v4.py qpsk 32000 1/2
-    python examples/benchmark_x86_stages_v4.py 32000 qam16 3/4      # order doesn't matter
-    python examples/benchmark_x86_stages_v4.py qpsk 32000 1/2 1296  # + override codeword length
+    python examples/benchmark_x86_stages_ldpc.py
+    python examples/benchmark_x86_stages_ldpc.py 32000
+    python examples/benchmark_x86_stages_ldpc.py qpsk 32000 1/2
+    python examples/benchmark_x86_stages_ldpc.py 32000 qam16 3/4      # order doesn't matter
+    python examples/benchmark_x86_stages_ldpc.py qpsk 32000 1/2 1296  # + override codeword length
 """
 from __future__ import annotations
 

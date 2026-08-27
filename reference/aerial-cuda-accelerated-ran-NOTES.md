@@ -78,7 +78,7 @@ UE, at any moment.
 
 This project doesn't need that generality: ONE fixed LDPC variant
 (whichever `ldpc_*_r*` is actually configured), ONE realistic batch
-size range (~8-30 codewords/frame, from `benchmark_x86_stages_v4.py`'s
+size range (~8-30 codewords/frame, from `benchmark_x86_stages_ldpc.py`'s
 own measurement). A purpose-built kernel here only needs to be
 specialized for that one, fixed (Z, k_bits, n_bits) shape -- not
 hundreds of variants.

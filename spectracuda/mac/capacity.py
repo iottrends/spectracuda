@@ -46,14 +46,16 @@ def compute_max_segment_bits(ofdm: Any, has_mac_header: bool) -> int:
     forcing every message through an exact 1784-bit multiple meant even
     the bind handshake (104 bits) or an ordinary short message had no
     valid size at all. The actual fix was in the FEC layer itself --
-    rs_m8 now supports "shortened" codewords (any byte-aligned length up
-    to one full block, see fec/reed_solomon.py's encode()/decode()
-    docstrings) -- so rs_m8's encoded_length() no longer raises for a
-    non-multiple length, and the search below no longer needs the
-    whole-block workaround AT ALL for rs_m8 -- back to the plain search,
-    now genuinely correct again. `accepts_partial_block` (set on `FEC`,
-    see fec.py) is what actually distinguishes rs_m8 (True) from LDPC
-    (False, still exact-multiple only, a documented separate gap) here."""
+    rs_m8 (and later, LDPC too) now supports "shortened" codewords (any
+    length up to one full block, see fec/reed_solomon.py's and
+    fec/ldpc.py's encode()/decode() docstrings) -- so encoded_length()
+    no longer raises for a non-multiple length, and the search below no
+    longer needs the whole-block workaround AT ALL for either -- back to
+    the plain search, now genuinely correct again. `accepts_partial_block`
+    (set on `FEC`, see fec.py) is what actually distinguishes a
+    shortening-capable scheme (rs_m8, every ldpc_*: True) from one that
+    genuinely still needs the whole-block search (currently none --
+    kept as a general fallback, not scheme-specific dead code) here."""
     limit = ofdm.MAX_PAYLOAD_SYMBOLS * ofdm.bits_per_ofdm_symbol
     packetizer = ofdm.packetizer
     fec0 = packetizer.fec_codec

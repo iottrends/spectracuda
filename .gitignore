@@ -22,6 +22,18 @@ venv/
 # same "reference, not shipped" status as liquid-dsp/libcorrect above.
 /reference/aerial-cuda-accelerated-ran/
 
+# Cloned to study cuLDPC's early-termination technique (syndrome-check
+# stopping mid-decode) -- same "reference, not shipped" status as the
+# other reference/ clones above.
+/reference/cuLDPC/
+
+# Cloned + locally built (build/) to benchmark a portable CPU-native
+# FEC alternative (custom QC-LDPC support, SIMD, built-in early
+# termination) against this project's own CUDA LDPC kernel and CPU
+# rs_m8+conv_v27 baseline -- same "reference, not shipped" status as
+# the other reference/ clones above.
+/reference/aff3ct/
+
 # Sphinx build output (spectracuda.readthedocs.io builds this itself) --
 # regenerate locally with `.venv/bin/python -m sphinx -b html docs docs/_build/html`.
 /docs/_build/

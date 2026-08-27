@@ -1,6 +1,6 @@
 """LDPC decode: numpy (CPU) vs cupy (CUDA), across a batch-size sweep.
 
-The question this answers: examples/benchmark_x86_stages_v4.py found
+The question this answers: examples/benchmark_x86_stages_ldpc.py found
 LDPC decode taking ~350-800ms on this project's x86 dev machine (numpy,
 batch size 12-28 codewords) -- roughly 2-3 orders of magnitude slower
 than the already-optimized Viterbi/RS paths it's meant to replace. Not
@@ -106,7 +106,7 @@ def run() -> None:
     print(f"=== LDPC decode: numpy vs cupy, variant={variant!r}, "
           f"batch sizes={batch_sizes} ===")
     print("    NOTE: decoding a CLEAN (error-free) codeword each time, matching "
-          "benchmark_x86_stages_v4.py's own no-channel-noise methodology (this repo's "
+          "benchmark_x86_stages_ldpc.py's own no-channel-noise methodology (this repo's "
           "benchmarks are digital-passthrough, no Channel/noise model) -- so these are "
           "BEST-CASE convergence numbers (early-exit once the syndrome hits zero), "
           "directly comparable to v4's own CPU numbers on that basis. A genuinely noisy "
@@ -150,7 +150,7 @@ def run() -> None:
               f"{numpy_mbps:>10.2f} | {cupy_mbps:>10.2f} | {'OK' if correct else 'MISMATCH!!'}")
 
     print("\nRead this as: numpy ms/call stays roughly FLAT as batch size grows (CPU has no "
-          "batch parallelism to exploit -- see examples/benchmark_x86_stages_v4.py's own finding), "
+          "batch parallelism to exploit -- see examples/benchmark_x86_stages_ldpc.py's own finding), "
           "while cupy ms/call should grow much more slowly than batch size, so cupy Mbps should "
           "climb steeply -- that gap IS the answer to whether GPU batching turns LDPC's numpy "
           "weakness into a real advantage for this project's FEC bottleneck.")

@@ -273,17 +273,57 @@ values. Missing, still a real parity gap:
   byte-aligned length; `FEC.accepts_partial_block` (new attribute) is
   what lets `capacity.py` tell `rs_m8` (now `True`) apart from LDPC
   (still `False` — see below).
-  **Explicitly out of scope, a separate documented gap, not silently
-  left behind**: every `ldpc_*` variant hits the identical "exact
-  multiple only" wall through `Mac(ofdm_kwargs=...)` — confirmed
-  directly, same symptom, same root cause — but LDPC's parity-check-
-  matrix structure isn't the same simple systematic-zero-pad case RS is,
-  so "shortening" it isn't the same fix. Still broken for `Mac`+LDPC
-  today. Regression tests: `tests/test_fec_reed_solomon.py`,
+  At the time this was written, every `ldpc_*` variant hit the identical
+  "exact multiple only" wall through `Mac(ofdm_kwargs=...)` — confirmed
+  directly, same symptom, same root cause — and was left as a separate,
+  explicitly out-of-scope gap, on the reasoning that LDPC's parity-
+  check-matrix structure isn't the same simple systematic-zero-pad case
+  RS is. **That reasoning turned out to be only half right — since
+  fixed (see below).** Regression tests: `tests/test_fec_reed_solomon.py`,
   `tests/test_fec.py`, and `tests/test_mac_block_oriented_fec.py` (the
   full real config — bind handshake, a short message, and a
   multi-segment message, all through `Mac`+`rs_m8`+`conv_v27` — none of
   which could complete at all before this fix).
+
+- [x] **`ldpc_*` now supports "shortened" codewords too — closing the
+  gap flagged immediately above.** Real 802.11n WiFi itself hits this
+  identical problem (fixed LDPC block sizes, arbitrary payload sizes)
+  and solves it with a documented technique: shortening + puncturing
+  (IEEE 802.11-2016 §19.5's LDPC parameter-selection procedure). Only
+  shortening — the simpler, non-lossy half, and the one that actually
+  matches RS's own fix — is implemented here. The "isn't the same fix"
+  reasoning above was half right: LDPC's decoder (iterative belief
+  propagation over per-bit LLRs) genuinely isn't RS's algebraic solve,
+  so the fix can't be "zero changes to the core math" the way RS's was.
+  But the SHAPE of the fix is identical: a message shorter than `k` is
+  treated as if `(k - real_k)` leading zero bits were really there
+  (same convention as RS), parity is computed against that full-length
+  message, and those synthetic zeros are never transmitted — only
+  `[real_k message bits | n_checks parity bits]` cross the air. The one
+  real difference from RS lands at decode time: the reinserted
+  positions get their channel LLR forced to a large CERTAIN magnitude
+  (they were never transmitted, so there's nothing to derive a
+  probability from) rather than the usual `p`-derived value — one
+  targeted change to LLR-initialization, the belief-propagation loop
+  itself untouched. `spectracuda/fec/ldpc.py`'s `encode()`/`decode()`
+  now accept any `1 <= real_k <= k` (`decode()` recovers `real_k`
+  directly from the codeword's own length, same as RS);
+  `spectracuda/fec/fec.py`'s wrapper now handles LDPC payloads as N full
+  blocks + at most one shortened leftover block (mirroring
+  `_encode_symbol_level`/`_decode_symbol_level`'s existing rs_m8
+  pattern via new `_encode_block_level`/`_decode_block_level`
+  helpers); `FEC.accepts_partial_block` is now `True` for every
+  `ldpc_*` variant, so `mac/capacity.py`'s `compute_max_segment_bits()`
+  uses the plain (correct, not whole-block-workaround) search for LDPC
+  too, same as it already did for rs_m8. Regression tests:
+  `tests/test_fec_ldpc.py` (shortened round trip + injected-error
+  correction + boundary cases), `tests/test_fec.py`'s wrapper-level
+  multi-block-plus-leftover coverage, and `tests/test_mac_ldpc_shortening.py`
+  (the full real config — bind handshake, a short message, and a
+  multi-segment message, all through `Mac`+LDPC — none of which could
+  complete at all before this fix, mirroring
+  `tests/test_mac_block_oriented_fec.py`'s existing rs_m8 coverage
+  exactly).
 
 ### 1.9 Layer 1 infra — implemented, lower priority to revisit
 `OfdmModulator`/`OfdmDemodulator` (FFT/IFFT + CP) and `ResourceGrid`

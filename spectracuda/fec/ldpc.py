@@ -79,11 +79,36 @@ raises `ValueError` (same as RS's `_decode_one` raising on the first
 uncorrectable item) rather than returning an unconverged, silently
 wrong codeword.
 
-Batch-shape contract: encode(bits) takes (n_batch, k) uint8 bits ->
-(n_batch, n) uint8 bits. decode(bits, p=0.02, max_iterations=None)
-takes (n_batch, n) received (possibly noisy) bits -> (n_batch, k)
-decoded bits; may raise ValueError if BP doesn't converge to a
+Batch-shape contract: encode(bits) takes (n_batch, real_k) uint8 bits
+for any 1 <= real_k <= k -> (n_batch, real_k + n_checks) uint8 bits
+(n_checks = n - k). decode(bits, p=0.02, max_iterations=None) takes
+(n_batch, real_k + n_checks) received (possibly noisy) bits -> (n_batch,
+real_k) decoded bits; may raise ValueError if BP doesn't converge to a
 zero-syndrome codeword within max_iterations for any batch item.
+real_k == k (i.e. codeword length == n) is the original, unchanged,
+full-length behavior.
+
+Shortening (real_k < k): same real-world need and same technique as
+`ReedSolomonCode`'s own shortened-block support (see reed_solomon.py's
+module docstring) -- a message shorter than k is treated as if
+(k - real_k) leading zero bits were really there (parity computed
+against that full-length message), but those implicit zeros are never
+transmitted -- only [real_k message bits | n_checks parity bits] cross
+the air, scaling with the real message, not the fixed block size. The
+one real difference from RS's version, worth being explicit about: RS's
+decoder (Berlekamp-Massey) is an algebraic solve that doesn't care
+where its input symbols came from, so shortening needed zero changes to
+its core math -- LDPC's decoder is iterative belief propagation over
+per-bit LLRs, so the fix has to hook in at LLR-initialization instead:
+the (k - real_k) reinserted positions get their channel LLR forced to a
+large CERTAIN magnitude (not derived from a received bit -- there is no
+received bit, they were never sent) rather than the usual p-derived
+value, and the belief-propagation loop itself is otherwise completely
+unchanged. This is the actual technique real 802.11n WiFi uses to fit
+LDPC's fixed (n, k) codes to arbitrary payload sizes (IEEE 802.11-2016
+Section 19.5's LDPC parameter-selection procedure combines shortening
+with puncturing; only shortening -- the simpler, non-lossy half -- is
+implemented here, matching what closed the identical `rs_m8` gap).
 """
 from __future__ import annotations
 
@@ -187,9 +212,11 @@ class LDPCCode(Block):
         self.k = self.n - n_checks
         self.rate_str = spec["rate"]
         self.batch_shape_doc = (
-            f"encode: (n_batch, {self.k}) bits -> (n_batch, {self.n}) bits. "
-            f"decode: (n_batch, {self.n}) bits -> (n_batch, {self.k}) bits "
-            f"(may raise ValueError on BP non-convergence)."
+            f"encode: (n_batch, real_k) bits for any 1<=real_k<={self.k} "
+            f'("shortened" LDPC -- see module docstring) -> (n_batch, '
+            f"real_k+{n_checks}) bits. decode: the inverse (may raise "
+            f"ValueError on BP non-convergence); real_k = {self.k} is the "
+            f"unchanged full-length behavior."
         )
 
         checks, variables = _expand_base_matrix(base, Z)
@@ -256,31 +283,81 @@ class LDPCCode(Block):
     # -- public API -----------------------------------------------------
 
     def encode(self, bits: Any) -> Any:
+        """bits: (n_batch, real_k) for any 1 <= real_k <= self.k --
+        "shortened" LDPC, same technique and same LEADING-zero
+        convention as ReedSolomonCode.encode() (see that module's
+        docstring): a message shorter than self.k is treated as if
+        (self.k - real_k) leading zero bits were really there --
+        parity is computed against that full-length [0-pad | real
+        message], but the synthetic zeros are never returned. Output is
+        (n_batch, real_k + n_checks), not always (n_batch, self.n).
+        real_k == self.k is the original, unchanged, full-length
+        behavior (output shape (n_batch, self.n))."""
         xp = self.xp
         bits = xp.asarray(bits)
         if bits.ndim == 1:
             bits = bits[None, :]
-        if bits.shape[-1] != self.k:
-            raise ValueError(f"expected {self.k} message bits, got {bits.shape[-1]}")
-        parity = (bits.astype("int32") @ self._G_parity.T) % 2
-        return xp.concatenate([bits.astype("uint8"), parity.astype("uint8")], axis=-1)
+        real_k = bits.shape[-1]
+        if not (1 <= real_k <= self.k):
+            raise ValueError(f"expected 1..{self.k} message bits, got {real_k}")
+        if real_k < self.k:
+            n_batch = bits.shape[0]
+            pad = xp.zeros((n_batch, self.k - real_k), dtype=bits.dtype)
+            full_bits = xp.concatenate([pad, bits], axis=-1)
+        else:
+            full_bits = bits
+        parity = (full_bits.astype("int32") @ self._G_parity.T) % 2
+        message_part = bits.astype("uint8")  # real_k bits only -- never the synthetic pad
+        return xp.concatenate([message_part, parity.astype("uint8")], axis=-1)
 
     def decode(self, bits: Any, p: float = 0.02, max_iterations: Optional[int] = None) -> Any:
+        """bits: (n_batch, real_k + n_checks) for any 1 <= real_k <=
+        self.k -- the shortened-codeword inverse of encode() above.
+        real_k is recovered from the codeword's OWN length (mirrors
+        ReedSolomonCode.decode(): the shortened codeword's length
+        already determines it uniquely, no separate parameter needed).
+        The (self.k - real_k) synthetic zero bits encode() computed
+        parity against are reinserted here as CERTAIN (channel_llr
+        forced to +pad_mag, never derived from a received bit -- they
+        were never transmitted, so there is nothing to observe) before
+        running the normal belief-propagation loop unchanged, then
+        stripped back off before returning. real_k == self.k (full-
+        length codeword, self.n bits) is the unchanged original
+        behavior."""
         xp = self.xp
         bits = xp.asarray(bits)
         if bits.ndim == 1:
             bits = bits[None, :]
-        if bits.shape[-1] != self.n:
-            raise ValueError(f"expected {self.n} codeword bits, got {bits.shape[-1]}")
+        n_checks = self.n - self.k
+        real_k = bits.shape[-1] - n_checks
+        if not (1 <= real_k <= self.k):
+            raise ValueError(
+                f"expected {1 + n_checks}..{self.n} codeword bits (real_k + "
+                f"{n_checks} for 1 <= real_k <= {self.k}), got {bits.shape[-1]}"
+            )
         if not (0.0 < p < 0.5):
             raise ValueError(f"p={p} must be in (0, 0.5) (assumed BSC crossover probability)")
         n_iterations = self.max_iterations if max_iterations is None else max_iterations
         n_batch = bits.shape[0]
-
-        llr_scale = float(math.log((1 - p) / p))
-        channel_llr = (1 - 2 * bits.astype("float32")) * llr_scale  # (n_batch, n)
+        n_shortened = self.k - real_k
 
         pad_mag = xp.asarray(np.float32(1e6))
+
+        if n_shortened > 0:
+            pad = xp.zeros((n_batch, n_shortened), dtype=bits.dtype)
+            full_bits = xp.concatenate([pad, bits], axis=-1)  # (n_batch, n) -- placeholder value, LLR forced below
+        else:
+            full_bits = bits
+
+        llr_scale = float(math.log((1 - p) / p))
+        channel_llr = (1 - 2 * full_bits.astype("float32")) * llr_scale  # (n_batch, n)
+        if n_shortened > 0:
+            # Never-transmitted positions are CERTAIN, not merely likely
+            # -- overwrite with the same "confident" magnitude already
+            # used below for check-message padding, not a p-derived
+            # value (p describes real channel noise; these bits never
+            # touched the channel at all).
+            channel_llr[:, :n_shortened] = pad_mag
         var_mask_f = self._var_slot_mask.astype("float32")
         check_mask = self._check_slot_mask
 
@@ -332,7 +409,7 @@ class LDPCCode(Block):
                 f"{n_iterations} iterations for batch item(s) {bad_items} -- too many "
                 f"errors for variant {self.variant!r} at p={p}"
             )
-        return hard_bits[:, : self.k]
+        return hard_bits[:, n_shortened : self.k]  # drop the synthetic leading zeros, if any
 
     def process(self, batch: Any, **kwargs: Any) -> Any:
         """Alias for encode() -- required to satisfy Block's abstract
