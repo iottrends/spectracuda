@@ -1,5 +1,19 @@
-"""v2 of benchmark_x86_stages_ldpc.py: same full OFDM TX/RX pipeline,
-but the RX LDPC-decode number comes from AFF3CT
+"""v2 of benchmark_x86_stages_ldpc.py: same full TX/RX pipeline, but
+through Mac(mode="um", ofdm_kwargs=...) -- send_iq()/receive_iq() --
+rather than Ofdm.generate_frame()/rx_process() directly. That sibling
+script (and this one, until now) called Ofdm directly specifically
+because Mac+LDPC didn't work AT ALL at the time -- LDPC had no
+"shortened block" support, so even the smallest Mac control PDU (the
+104-bit bind handshake) had no valid size (see docs/todo.md's
+`ldpc_*`-shortened-codeword entry, and tests/test_mac_ldpc_shortening.py
+for the regression coverage that fix now has). That gap is closed, so
+this script exercises the real thing: two independent Mac units,
+binding, then send_iq()/receive_iq() for both the correctness gate and
+the timed TX/RX passes below -- the Mac-layer header-encode/segment
+overhead (small, but real) is part of what's measured here now, not
+routed around.
+
+Also the RX LDPC-decode number itself: it comes from AFF3CT
 (https://github.com/aff3ct/aff3ct, MIT-licensed, portable x86/ARM
 SIMD FEC library, see reference/aff3ct/ and
 examples/export_ldpc_qc_for_aff3ct.py), not spectracuda's own native
@@ -22,18 +36,24 @@ writes into, out of scope for a benchmark script). So this script does
 NOT run this frame's actual payload through AFF3CT.
 
 What it DOES do, honestly:
-1. Runs the real spectracuda TX chain (generate_frame()) and ONE real
-   RX pass (rx_process(), spectracuda's own unpatched numpy LDPC
-   decode) purely as a correctness gate -- confirms the frame this
-   script built actually round-trips before trusting anything below.
-   Not timed in a loop -- one call is enough to prove correctness, and
-   its number is not the point of this script.
+1. Runs the real Mac TX chain (mac_tx.send_iq()) and ONE real RX pass
+   (mac_rx.receive_iq(), spectracuda's own unpatched numpy LDPC decode)
+   purely as a correctness gate -- confirms the frame this script built
+   actually round-trips (Mac header decode + CRC + LDPC, all real)
+   before trusting anything below. Not timed in a loop -- one call is
+   enough to prove correctness, and its number is not the point of this
+   script.
 2. Times the REST of RX (sync/CFO/OFDM-decode/channel-est+equalizer --
    the stages AFF3CT has no equivalent for) over N_ROUNDS, with
    LDPCCode.decode() STUBBED OUT to an instant no-op for this pass
    only (see `_install_fast_stub_decode()`) -- so this loop isn't
    wasted re-measuring the already-known-slow numpy LDPC decode 30
-   times just to discard the number.
+   times just to discard the number. Still goes through
+   mac_rx.receive_iq() (not ofdm.rx_process() directly), so the Mac
+   header/reassembly bookkeeping is part of the same measured pipeline
+   -- every one of these calls fails its own CRC check against the
+   stubbed garbage decode, so it never actually touches reassembly
+   state (see run()'s own comment at that loop).
 3. Separately invokes the real AFF3CT binary (subprocess, not
    simulated/estimated) with -F set to this frame's exact
    n_ldpc_blocks, over the exact same LDPC variant/matrix (see
@@ -99,8 +119,9 @@ from spectracuda.channel.ls import LSChannelEstimator
 from spectracuda.equalizer.mmse import MMSEEqualizer
 from spectracuda.fec.crc import CRC
 from spectracuda.fec.ldpc import LDPCCode
+from spectracuda.mac import Mac
+from spectracuda.mac.pdu import HEADER_LEN_BITS
 from spectracuda.ofdm.fft import OfdmDemodulator
-from spectracuda.pipeline import Ofdm
 from spectracuda.sync.schmidl_cox import SchmidlCoxSync
 
 # Sibling script, not a library -- importable because "python
@@ -254,14 +275,52 @@ def _install_fast_stub_decode():
     return restore
 
 
-def _actual_payload_bits(requested_bits: int, k_bits: int, crc_bits: int) -> int:
-    """See benchmark_x86_stages_ldpc.py's own _actual_payload_bits()."""
-    n_blocks = max(1, -(-(requested_bits + crc_bits) // k_bits))
+def _actual_payload_bits(
+    requested_bits: int, k_bits: int, crc_bits: int, header_bits: int, max_segment_bits: int,
+) -> tuple:
+    """Diverges from benchmark_x86_stages_ldpc.py's own
+    _actual_payload_bits(): that one only ever backs `crc_bits` out of
+    the LDPC block math because it has no Mac layer at all. This one
+    goes through Mac, so the MAC header (`header_bits`, see
+    spectracuda/mac/pdu.py) rides inside the same LDPC-encoded PDU too
+    (Mac feeds Ofdm.generate_frame() the whole header+segment, see
+    Mac.send_iq()) -- it has to come out of the same block-count search
+    or n_ldpc_blocks below would be wrong.
+
+    Also folds in what run()'s old manual "clamp down to one frame"
+    branch used to do by hand (comparing against ofdm.MAX_PAYLOAD_SYMBOLS
+    directly, with an explicit "no Mac layer at this level" comment) --
+    now just backs the block count down until payload_bits fits Mac's
+    OWN real capacity for one segment (`max_segment_bits` ==
+    mac.max_segment_bits, already header-aware, see capacity.py). Returns
+    (payload_bits, n_ldpc_blocks, clamped)."""
+    overhead = crc_bits + header_bits
+
+    def _payload_for(n: int) -> int:
+        return n * k_bits - overhead
+
+    n_blocks = max(1, -(-(requested_bits + overhead) // k_bits))
     while True:
-        payload_bits = n_blocks * k_bits - crc_bits
-        if payload_bits >= requested_bits and payload_bits % 8 == 0:
-            return payload_bits
+        payload_bits = _payload_for(n_blocks)
+        if payload_bits >= requested_bits and payload_bits >= 8 and payload_bits % 8 == 0:
+            break
         n_blocks += 1
+
+    clamped = False
+    if payload_bits > max_segment_bits:
+        clamped = True
+        while True:
+            n_blocks -= 1
+            if n_blocks < 1:
+                raise SystemExit(
+                    f"max_segment_bits={max_segment_bits} is too small to fit even one "
+                    f"{k_bits}-bit LDPC block after header+CRC overhead ({overhead} bits)"
+                )
+            payload_bits = _payload_for(n_blocks)
+            if 8 <= payload_bits <= max_segment_bits and payload_bits % 8 == 0:
+                break
+
+    return payload_bits, n_blocks, clamped
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +448,8 @@ def run() -> None:
         channel_estimator="ls", equalizer="mmse",
         backend="numpy",
     )
-    print(f"=== benchmark_x86_stages_ldpc_aff3ct (real Ofdm TX/RX pipeline, LDPC decode via "
-          f"AFF3CT -- see module docstring) config: "
+    print(f"=== benchmark_x86_stages_ldpc_aff3ct (real Mac(mode='um')+Ofdm TX/RX pipeline, "
+          f"LDPC decode via AFF3CT -- see module docstring) config: "
           f"fft_size={FFT_SIZE}, n_pilot={N_PILOT}, n_data={N_DATA}, cp_len={CP_LEN}, "
           f"modem={MODEM_SCHEME}, fec={LDPC_VARIANT!r} (rate {LDPC_RATE}), crc=crc16, "
           f"sdu_bits={SDU_BITS} (requested) ===")
@@ -399,57 +458,94 @@ def run() -> None:
     aff3ct_bin = _find_aff3ct_binary()
     print(f"    AFF3CT binary: {aff3ct_bin}")
 
-    ofdm = Ofdm(**phy_kwargs)
+    # Two independent Mac units, each owning its own Ofdm (see Mac's own
+    # class docstring -- never shared) -- mode="um" for the same reason
+    # tests/test_mac_ldpc_shortening.py picked it: segmentation +
+    # sequence-numbered reassembly, no retransmission complexity, and
+    # (now that LDPC's own shortened-codeword support closed the gap --
+    # see fec/ldpc.py's module docstring / docs/todo.md) the mode that
+    # config was actually proven to bind and round-trip through.
+    mac_tx = Mac(mode="um", ofdm_kwargs=phy_kwargs)
+    mac_rx = Mac(mode="um", ofdm_kwargs=phy_kwargs)
+    bind_resp = mac_rx.handle_bind_request_iq(mac_tx.build_bind_request())
+    if bind_resp is None or not mac_tx.handle_bind_response_iq(bind_resp):
+        raise SystemExit("Bind handshake failed -- see spectracuda/mac/bind.py")
+
+    ofdm = mac_tx.ofdm  # FEC/CRC introspection only below -- TX/RX itself goes through mac_tx/mac_rx from here on
     k_bits = ofdm.packetizer.fec_codec.k_bits
     n_bits = ofdm.packetizer.fec_codec.n_bits
     crc_bits = ofdm.packetizer.crc_codec.key_length * 8
-    payload_bits = _actual_payload_bits(SDU_BITS, k_bits, crc_bits)
-    n_ldpc_blocks = (payload_bits + crc_bits) // k_bits
-
-    max_encoded_bits = ofdm.MAX_PAYLOAD_SYMBOLS * ofdm.bits_per_ofdm_symbol
-    max_blocks = max_encoded_bits // n_bits
-    if n_ldpc_blocks > max_blocks:
-        max_payload_bits = _actual_payload_bits(0, k_bits, crc_bits) if max_blocks == 0 else max_blocks * k_bits - crc_bits
-        print(f"    NOTE: clamped down to the largest payload that fits in one frame: "
-              f"{max_payload_bits} bits ({max_blocks} blocks) -- see benchmark_x86_stages_ldpc.py's "
-              f"module docstring for why (no Mac layer at this level).")
-        payload_bits = max_payload_bits
-        n_ldpc_blocks = max_blocks
+    payload_bits, n_ldpc_blocks, clamped = _actual_payload_bits(
+        SDU_BITS, k_bits, crc_bits, HEADER_LEN_BITS, mac_tx.max_segment_bits
+    )
+    if clamped:
+        print(f"    NOTE: clamped down to the largest payload that fits in one Mac segment/frame: "
+              f"{payload_bits} bits ({n_ldpc_blocks} blocks) -- mac_tx.max_segment_bits="
+              f"{mac_tx.max_segment_bits} (already accounts for the {HEADER_LEN_BITS}-bit MAC header).")
     elif payload_bits != SDU_BITS:
         print(f"    NOTE: padded requested {SDU_BITS} bits up to {payload_bits} bits "
               f"({n_ldpc_blocks}x {k_bits}-bit LDPC blocks).")
 
     rng = np.random.default_rng(0)
     payload = rng.integers(0, 2, size=payload_bits).astype("uint8")
-    frame = ofdm.generate_frame(payload[None, :])
-    print(f"\nPayload: {payload_bits} bits -> {n_ldpc_blocks} LDPC codeword(s) of {k_bits}->{n_bits} bits each")
+    print(f"\nPayload: {payload_bits} bits (+{HEADER_LEN_BITS}-bit MAC header) -> "
+          f"{n_ldpc_blocks} LDPC codeword(s) of {k_bits}->{n_bits} bits each")
 
-    # -- full TX chain --
-    for _ in range(N_WARMUP):
-        ofdm.generate_frame(payload[None, :])
-    start = time.perf_counter()
-    for _ in range(N_ROUNDS):
-        frame = ofdm.generate_frame(payload[None, :])
-    tx_time = (time.perf_counter() - start) / N_ROUNDS
-    print(f"\nfull TX chain (generate_frame(), 1 frame): {tx_time * 1000:.4f} ms/frame")
+    # -- correctness gate: ONE real send_iq()/receive_iq() round trip,
+    # real (unpatched) numpy LDPC decode + real Mac header/CRC -- not
+    # timed in a loop, see module docstring point 1. Done BEFORE either
+    # Mac's sequence-number counter has advanced at all, so mac_rx's
+    # freshly-bound expected_sn=0 lines up with mac_tx's first-ever send
+    # (see spectracuda/mac/reassembly.py's ReassemblyBuffer docstring --
+    # it does not bootstrap expected_sn from arrival order).
+    frames = mac_tx.send_iq(payload)
+    assert len(frames) == 1, (
+        f"sizing above should keep this to exactly one Mac segment/frame, got {len(frames)}"
+    )
+    total_samples = frames[0].shape[-1]
+    samples_per_symbol = ofdm.fft_size + ofdm.cp_len
+    other_symbols = (total_samples - ofdm.fft_size) / samples_per_symbol
+    payload_symbols = other_symbols - ofdm.n_training_symbols - ofdm.num_symbols_header
+    print(f"One frame: {total_samples} IQ samples = "
+          f"1 preamble symbol ({ofdm.fft_size} samples, no CP) + "
+          f"{ofdm.n_training_symbols} training + {ofdm.num_symbols_header} header + "
+          f"{payload_symbols:.0f} payload OFDM symbols ({samples_per_symbol} samples/symbol each) "
+          f"-- payload symbols carry the {HEADER_LEN_BITS}-bit MAC header + {payload_bits}-bit SDU together")
 
-    # -- correctness gate: ONE real RX pass, real (unpatched) numpy LDPC
-    # decode -- not timed in a loop, see module docstring point 1 --
-    result = ofdm.rx_process(frame)
-    bit_exact = np.array_equal(np.asarray(result["bits"])[0], payload)
+    delivered = mac_rx.receive_iq(frames[0])
+    bit_exact = len(delivered) == 1 and np.array_equal(np.asarray(delivered[0]), payload)
     print(f"decode check: {'bit-exact match' if bit_exact else 'MISMATCH -- see below'} "
-          f"(real spectracuda numpy decode, one pass, correctness gate only)")
+          f"(real Mac send_iq()/receive_iq(), one pass, correctness gate only)")
     if not bit_exact:
         raise SystemExit("Correctness gate failed -- refusing to report timing for a broken frame.")
 
+    # -- full TX chain -- mac_tx.send_iq() itself (UmEntity.transmit()'s
+    # segmentation/header encode + Ofdm.generate_frame()), not
+    # generate_frame() alone -- this is the actual Mac-layer TX cost, not
+    # just the PHY's.
+    for _ in range(N_WARMUP):
+        mac_tx.send_iq(payload)
+    start = time.perf_counter()
+    for _ in range(N_ROUNDS):
+        frame = mac_tx.send_iq(payload)[0]
+    tx_time = (time.perf_counter() - start) / N_ROUNDS
+    print(f"\nfull TX chain (Mac.send_iq(), 1 frame): {tx_time * 1000:.4f} ms/frame")
+
     # -- RX stage breakdown: sync/CFO/OFDM-decode/chanest+eq only, LDPC
-    # decode stubbed to a no-op for this pass -- see module docstring point 2 --
+    # decode stubbed to a no-op for this pass -- see module docstring
+    # point 2. Goes through mac_rx.receive_iq() (not ofdm.rx_process()
+    # directly) so Mac's header-decode/reassembly overhead sits inside
+    # the same measured pipeline it would in real use -- every call here
+    # fails its own CRC check against the stubbed garbage decode (same
+    # decode() stub as before), so _rx_one_frame() bails out before ever
+    # reaching reassembly -- this loop never actually mutates mac_rx's
+    # reassembly state.
     rx_timings: dict = defaultdict(float)
     restore_timing = _install_timing_patch(rx_timings)
     restore_stub = _install_fast_stub_decode()
     try:
         for _ in range(N_ROUNDS):
-            ofdm.rx_process(frame)
+            mac_rx.receive_iq(frame)
     finally:
         restore_stub()
         restore_timing()
