@@ -63,7 +63,7 @@ it proves, but not this class's job).
 """
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -77,6 +77,7 @@ from .bind import (
 )
 from .capacity import compute_max_segment_bits
 from .quality import LinkQualityTracker, decode_quality_report, encode_quality_report
+from ..framing import compute_rssi_db
 from .tm import TmEntity
 from .um import UmEntity
 
@@ -109,6 +110,12 @@ class Mac:
             from spectracuda.pipeline import Ofdm
 
             self.ofdm = Ofdm(**ofdm_kwargs)
+            # Kept verbatim (not just self.ofdm) so receive_iq_batch()
+            # can later build independent Ofdm REPLICAS from the exact
+            # same config -- see that method's own docstring for why a
+            # pool of separate instances, not concurrent calls into this
+            # one self.ofdm, is what real multi-core decode requires.
+            self._ofdm_kwargs = dict(ofdm_kwargs)
             if self.ofdm.crc == "none":
                 raise ValueError(
                     "Mac(ofdm_kwargs=...) requires crc != 'none' in ofdm_kwargs -- "
@@ -126,6 +133,7 @@ class Mac:
             max_segment_bits = derived
         else:
             self.ofdm = None
+            self._ofdm_kwargs = None
             if max_segment_bits is None:
                 raise ValueError("max_segment_bits is required when ofdm_kwargs is not given")
 
@@ -202,6 +210,96 @@ class Mac:
         pdus = self._impl.transmit(sdu_bits)
         return [self.ofdm.generate_frame(np.asarray(pdu, dtype="uint8")[None, :]) for pdu in pdus]
 
+    def _rx_process_only(self, ofdm: Any, iq_array: Any) -> Optional[Dict[str, Any]]:
+        """The PURE-decode half of what used to be _rx_one_frame() in one
+        piece: just `ofdm.rx_process(iq_array)` (sync/CFO/OFDM-demod/
+        channel-est/equalizer/FEC decode -- the expensive part), or None
+        on the same ValueError/NotImplementedError this always treated
+        as "didn't arrive usably." Touches ONLY the given `ofdm` instance
+        -- no self.quality, no self._impl -- specifically so
+        receive_iq_batch() below can run many of these concurrently, one
+        thread per independent Ofdm replica, without two threads ever
+        touching the same mutable state.
+
+        Why a SEPARATE ofdm argument, not always self.ofdm: the native
+        Viterbi/RS decoders underneath (fec/_native.py) each own ONE
+        persistent C struct, reset at the START of every decode call and
+        reused across calls -- correct for sequential reuse, but two
+        threads calling decode() through the SAME instance concurrently
+        would race on that struct's internal buffers (history_buffer,
+        error_buffer), corrupting both results. A pool of independent
+        Ofdm replicas (see _ofdm_replica_pool()), one per concurrent
+        worker, sidesteps this entirely -- proven safe first as an
+        isolated ThreadPoolExecutor experiment against bare
+        ConvolutionalCode instances before wiring it in here.
+
+        NotImplementedError still means "nothing usable, nothing to
+        say" (None, as before) -- but ValueError specifically covers an
+        uncorrectable-FEC payload decode failure (see ofdm.py's
+        rx_process()/Packetizer.decode()), which happens AFTER sync and
+        header decode already succeeded: a real, informative frame
+        attempt, not silence. Found via examples/drone_tui/
+        adaptive_mcs.py's own real-status-exchange test: at a marginal
+        SNR, MOST corrupted qam64 frames failed this way rather than via
+        crc_valid=False, and the old bare `return None` here made every
+        one of them invisible to self.quality entirely (not merely
+        "not delivered" -- literally never counted as an attempt) --
+        directly contradicting _rx_one_frame()'s own documented
+        "every attempt -- success or failure -- feeds self.quality"
+        contract, and starving any decision (adaptive MCS included)
+        that reads delivered_ratio of the very evidence it needs most.
+        ofdm.rx_process() itself never gets to return its own dict in
+        this case (the exception unwinds past its rssi_db/evm
+        computation), so rssi_db is recomputed here the same way it
+        does -- compute_rssi_db() over the whole raw iq_array,
+        unconditionally, before any header/payload decode is attempted
+        (see ofdm.py's rx_process()) -- evm has no such fallback (it's
+        inherently a post-equalization, payload-content quantity) and is
+        left None, same as any other frame_found=False result already
+        leaves it. frame_found=False here (not True with crc_valid=
+        False) is the honest characterization: this method only knows
+        the payload was unrecoverable, not that the frame itself was
+        genuinely present versus e.g. a borderline sync false-trigger."""
+        try:
+            return ofdm.rx_process(iq_array)
+        except NotImplementedError:
+            return None
+        except ValueError:
+            xp = ofdm.xp
+            rx_iq = xp.asarray(iq_array)
+            if rx_iq.ndim == 1:  # match rx_process()'s own top-of-function reshape (ofdm.py) --
+                rx_iq = rx_iq[None, :]  # compute_rssi_db() needs a batch axis, not a bare (N,) array
+            return {
+                "frame_found": False,
+                "crc_valid": None,
+                "rssi_db": compute_rssi_db(xp, rx_iq),
+                "evm": None,
+                "bits": None,
+            }
+
+    def _apply_rx_result(self, result: Optional[Dict[str, Any]]) -> Optional[np.ndarray]:
+        """The STATEFUL half of what used to be _rx_one_frame(): quality
+        bookkeeping (self.quality.observe()) plus the delivered/CRC
+        check, given an already-computed _rx_process_only() result (or
+        None). Deliberately kept single-threaded-only -- self.quality is
+        one shared LinkQualityTracker, so every call site (receive_iq()
+        directly, receive_iq_batch() after its parallel decode phase)
+        must call this in plain sequential order, never concurrently."""
+        if result is None:
+            return None
+        crc_valid = result["crc_valid"]
+        delivered = bool(result["frame_found"]) and (crc_valid is None or bool(self._to_host(crc_valid)[0]))
+        rssi_db = result["rssi_db"]
+        evm = result["evm"]
+        self.quality.observe(
+            rssi_db=float(self._to_host(rssi_db)[0]),
+            evm=None if evm is None else float(self._to_host(evm)[0]),
+            delivered=delivered,
+        )
+        if not delivered:
+            return None
+        return self._to_host(result["bits"])[0].astype("uint8")
+
     def _rx_one_frame(self, iq_array: Any) -> Optional[np.ndarray]:
         """One arrived IQ frame -> the decoded raw bits (post header/FEC/
         CRC, still PDU-level -- not yet handed to self._impl.receive()),
@@ -213,7 +311,11 @@ class Mac:
 
         Shared by receive_iq() and the bind/quality IQ handlers below --
         all of them need this exact rx_process/quality/failure-handling
-        logic, not four separate copies of it.
+        logic, not four separate copies of it. Just
+        _apply_rx_result(_rx_process_only(...)) against self.ofdm --
+        split into those two pieces (see their own docstrings) so
+        receive_iq_batch() can reuse each half on its own terms, not
+        because this method itself needed to change.
 
         A real bug lived here until caught on actual CUDA hardware (a
         Colab Tesla T4, 2026-08-25): this used to run every value below
@@ -228,22 +330,7 @@ class Mac:
         un-coerced (rx_process() does its own xp.asarray() internally,
         correctly handling either backend), and every value actually
         read out of `result` goes through self._to_host() first."""
-        try:
-            result = self.ofdm.rx_process(iq_array)
-        except (ValueError, NotImplementedError):
-            return None
-        crc_valid = result["crc_valid"]
-        delivered = bool(result["frame_found"]) and (crc_valid is None or bool(self._to_host(crc_valid)[0]))
-        rssi_db = result["rssi_db"]
-        evm = result["evm"]
-        self.quality.observe(
-            rssi_db=float(self._to_host(rssi_db)[0]),
-            evm=None if evm is None else float(self._to_host(evm)[0]),
-            delivered=delivered,
-        )
-        if not delivered:
-            return None
-        return self._to_host(result["bits"])[0].astype("uint8")
+        return self._apply_rx_result(self._rx_process_only(self.ofdm, iq_array))
 
     def _to_host(self, arr: Any) -> np.ndarray:
         """arr may genuinely be a cupy.ndarray (whenever self.ofdm.backend
@@ -271,12 +358,97 @@ class Mac:
         receive_iq() only ever does the DATA-forward half (see
         send_iq()'s docstring)."""
         self._require_ofdm("receive_iq")
-        delivered_bits = self._rx_one_frame(iq_array)
+        return self._deliver(self._rx_one_frame(iq_array))
+
+    def _deliver(self, delivered_bits: Optional[np.ndarray]) -> Any:
+        """Shared by receive_iq() and receive_iq_batch(): mode-dependent
+        hand-off of already-decoded PDU bits (or None) to self._impl --
+        pulled out so both call sites apply the EXACT same per-mode
+        logic, not two copies that could drift."""
         if delivered_bits is None:
             return [] if self.mode in ("um", "am") else None  # tm.receive() is one array, not a list
         if self.mode == "am":
             return self._impl.receive_data(delivered_bits)
         return self._impl.receive(delivered_bits)
+
+    def _ofdm_replica_pool(self, n: int) -> List[Any]:
+        """Lazily builds (and caches) a pool of >= n independent Ofdm
+        instances, each constructed fresh from the exact same
+        ofdm_kwargs self.ofdm itself was built from -- see
+        receive_iq_batch()'s docstring for why real concurrent decode
+        needs genuinely separate instances, not n threads sharing this
+        Mac's own self.ofdm. Grows (never shrinks) the cached pool if a
+        later call asks for more replicas than exist yet; a smaller
+        later request just uses a prefix of the same cached list, so
+        the replicas already spent effort caching their own compiled
+        native FEC codecs stay warm across calls instead of being
+        rebuilt from scratch every time."""
+        if not hasattr(self, "_ofdm_replicas"):
+            self._ofdm_replicas: List[Any] = []
+        from spectracuda.pipeline import Ofdm
+
+        while len(self._ofdm_replicas) < n:
+            self._ofdm_replicas.append(Ofdm(**self._ofdm_kwargs))
+        return self._ofdm_replicas[:n]
+
+    def receive_iq_batch(self, iq_arrays: List[Any], n_workers: int = 2) -> List[Any]:
+        """Like calling receive_iq() once per arrived IQ frame in
+        iq_arrays, in the SAME order, with the SAME per-frame return
+        values -- except the expensive part (sync/CFO/OFDM-demod/
+        channel-est/equalizer/FEC decode, i.e. Ofdm.rx_process()) runs
+        across up to n_workers frames AT ONCE, on real separate CPU
+        cores, not n_workers=1 sequential calls.
+
+        Why this needs its own method rather than just calling
+        receive_iq() from n threads: the native Viterbi/RS decoders
+        (fec/_native.py) each own ONE persistent C struct that gets
+        reset, not recreated, at the start of every decode call --
+        correct for sequential reuse of self.ofdm, but two threads
+        decoding through that SAME struct concurrently would race on
+        its internal history_buffer/error_buffer state and silently
+        corrupt both results. This method instead round-robins frames
+        across a POOL of independent Ofdm replicas (_ofdm_replica_pool,
+        one per worker thread) built from the identical config
+        self.ofdm itself uses -- proven necessary and sufficient first
+        as an isolated ThreadPoolExecutor experiment against bare
+        ConvolutionalCode instances, before wiring it in here.
+
+        The stateful half of what a normal receive_iq() call does
+        (self.quality.observe(), self._impl.receive()/receive_data())
+        is deliberately run AFTERWARDS, single-threaded, in the
+        original frame order -- self.quality and self._impl (the
+        UM ReassemblyBuffer's sequence-number window, in particular)
+        are shared mutable state this Mac owns ONCE, so touching them
+        from multiple threads at once -- even just to append -- isn't
+        something this method takes on faith is safe. Only the pure
+        per-frame decode step (each frame's own independent replica)
+        actually runs in parallel; everything that reads or writes
+        self's own state runs exactly as it always did."""
+        self._require_ofdm("receive_iq_batch")
+        if not iq_arrays:
+            return []
+        n_workers = max(1, min(n_workers, len(iq_arrays)))
+        if n_workers == 1:
+            results = [self._rx_process_only(self.ofdm, iq) for iq in iq_arrays]
+        else:
+            import concurrent.futures
+
+            replicas = self._ofdm_replica_pool(n_workers)
+            results: List[Optional[Dict[str, Any]]] = [None] * len(iq_arrays)
+
+            def _worker(worker_idx: int) -> None:
+                # Each worker owns exactly one replica for its whole
+                # life here -- frames are assigned round-robin, so no
+                # two concurrently-running tasks ever touch the same
+                # Ofdm instance (see this method's own docstring).
+                ofdm = replicas[worker_idx]
+                for i in range(worker_idx, len(iq_arrays), n_workers):
+                    results[i] = self._rx_process_only(ofdm, iq_arrays[i])
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
+                list(ex.map(_worker, range(n_workers)))
+
+        return [self._deliver(self._apply_rx_result(result)) for result in results]
 
     # -- binding + link-quality reporting, IQ-level ----------------------
     # Mode-agnostic (unlike send_iq()/receive_iq()) -- binding and
