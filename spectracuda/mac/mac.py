@@ -506,6 +506,47 @@ class Mac:
         self.bound = response["accepted"]
         return self.bound
 
+    def set_tx_scheme(
+        self, modem: Optional[str] = None, fec: Optional[str] = None, fec1: Optional[str] = None
+    ) -> int:
+        """Adaptive-MCS entry point: change this Mac's own OUTGOING
+        modem/fec/fec1 choice (via Ofdm.reconfigure_tx_scheme() -- see
+        its docstring for why that's an in-place reconfigure, not a
+        rebuild-the-Ofdm operation), then propagate the resulting
+        max_segment_bits change down into this mode's segmentation, so
+        the NEXT send_iq() call segments against the new PHY capacity
+        instead of a stale one.
+
+        Caller's responsibility, not enforced here: serialize this
+        against any concurrent send_iq() the same way examples/drone_tui/
+        already serializes generate_frame() calls on one Ofdm (one
+        shared push_lock) -- reconfigure_tx_scheme() mutates self.ofdm's
+        modem/packetizer while a concurrent send_iq() could be mid-
+        generate_frame() against the very same attributes. There is no
+        mid-SDU hazard beyond that: send_iq() segments and returns an
+        entire SDU's PDUs in one synchronous call (see its own
+        docstring), so switching between two send_iq() calls is always
+        a clean segmentation-generation boundary, never a partial one.
+
+        Returns the new max_segment_bits."""
+        self._require_ofdm("set_tx_scheme")
+        self.ofdm.reconfigure_tx_scheme(modem=modem, fec=fec, fec1=fec1)
+        self.max_segment_bits = compute_max_segment_bits(self.ofdm, has_mac_header=(self.mode != "tm"))
+        # Segmentation bound lives on self._impl (TmEntity/UmEntity keep
+        # their own copy passed at construction, see their docstrings;
+        # AmEntity wraps a UmEntity internally, see am.py) -- self.
+        # max_segment_bits above is this Mac's own record of the current
+        # value (read by build_bind_request() etc.), not itself consulted
+        # by any of these three entities' segmentation, so both must be
+        # kept in step here rather than relying on one to imply the other.
+        if self.mode == "tm":
+            self._impl.max_segment_bits = self.max_segment_bits
+        elif self.mode == "um":
+            self._impl._segmenter.max_segment_bits = self.max_segment_bits
+        else:  # am
+            self._impl._um._segmenter.max_segment_bits = self.max_segment_bits
+        return self.max_segment_bits
+
     def build_quality_report(self) -> np.ndarray:
         """This Mac's own accumulated LinkQualityTracker stats, as IQ."""
         self._require_ofdm("build_quality_report")

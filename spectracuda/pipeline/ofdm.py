@@ -514,6 +514,77 @@ class Ofdm(Block):
             backend=resolved_backend,
         )
 
+    def reconfigure_tx_scheme(
+        self, modem: Optional[str] = None, fec: Optional[str] = None, fec1: Optional[str] = None
+    ) -> int:
+        """Change this object's OWN transmit-side modem/fec/fec1 choice
+        (what `generate_frame()` uses next) WITHOUT rebuilding the rest
+        of this Ofdm -- for adaptive MCS. Each argument left as None
+        keeps that piece unchanged; at least one should be given or this
+        is a no-op.
+
+        Deliberately NOT "throw this Ofdm away, build a new one with
+        different kwargs" -- two real reasons, not just avoided
+        boilerplate:
+
+        1. This same object also owns the RX-side streaming state
+           (`self._stream_buffer`/`self._stream_header`, see
+           reset_stream()/rx_streaming()) for the OTHER direction of a
+           full-duplex Mac -- discarding and recreating the object would
+           lose whatever partial frame is sitting in that buffer, purely
+           because THIS side's own outgoing scheme changed (the peer's
+           transmit scheme is completely independent). Every field
+           touched below is scheme-derived only; grid/header_codec/sync/
+           mod/demod/equalizer/preamble/_stream_buffer/
+           _rx_payload_codec_cache are untouched.
+        2. Rebuilding `Packetizer`/`FEC` from scratch reconstructs native
+           Viterbi trellis / RS GF-table structs -- real, non-free setup
+           this class already goes out of its way to avoid paying
+           needlessly (see `_rx_payload_codec_cache`'s own docstring
+           above, "~0.15ms/frame" for exactly this construction cost).
+           Changing only what actually changed avoids paying it on every
+           MCS transition for parameters that didn't move.
+
+        The RX side needs no corresponding change at all: rx_process()
+        already resolves mod_scheme/fec0/fec1 from the DECODED header,
+        never from self (see class docstring) -- a peer running an
+        unmodified Ofdm decodes a scheme-switched frame exactly as it
+        would any other frame from a DIFFERENT sender using a different
+        scheme, because that's the same code path either way.
+
+        Returns the (possibly unchanged) `self.bits_per_ofdm_symbol` --
+        callers with their own segmentation math derived from it (e.g.
+        `Mac.max_segment_bits`, via `mac/capacity.py`) need to know
+        whether/how it moved."""
+        if fec is not None and fec != "none" and fec not in _FEC_SCHEME_CODES:
+            raise ValueError(f"fec={fec!r}; expected one of {sorted(_FEC_SCHEME_CODES)}")
+        if fec1 is not None and fec1 != "none" and fec1 not in _FEC_SCHEME_CODES:
+            raise ValueError(f"fec1={fec1!r}; expected one of {sorted(_FEC_SCHEME_CODES)}")
+
+        if modem is not None and modem != self.modem.scheme:
+            self.modem = Modem(modem, backend=self.backend)
+            self.bits_per_ofdm_symbol = self.grid.n_data * self.modem.bits_per_symbol
+            # Same seed as __init__ (7777) -- deterministic/reproducible
+            # content, not security-sensitive (see __init__'s own
+            # comment), just resized to the new bits_per_ofdm_symbol.
+            self._payload_filler_bits = np.random.default_rng(7777).integers(
+                0, 2, size=self.bits_per_ofdm_symbol
+            ).astype("uint8")
+
+        new_fec = self.fec if fec is None else fec
+        new_fec1 = self.fec1 if fec1 is None else fec1
+        if new_fec != self.fec or new_fec1 != self.fec1:
+            self.packetizer = Packetizer(
+                crc=self.crc, fec=new_fec, fec1=new_fec1, interleaver=self.interleaver,
+                interleaver_kwargs=self.interleaver_kwargs, backend=self.backend,
+            )
+            self.fec = new_fec
+            self.fec1 = new_fec1
+            self.fec_codec = self.packetizer.fec_codec
+            self.crc_codec = self.packetizer.crc_codec
+
+        return self.bits_per_ofdm_symbol
+
     # -- internal helpers ---------------------------------------------------
 
     def _to_host(self, arr: Any) -> np.ndarray:
