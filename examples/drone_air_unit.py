@@ -108,7 +108,30 @@ def _send_chunks(push_socket, iq_frame, push_lock):
     path every ~500ms indefinitely instead of stabilizing, even though
     air was genuinely alive and sending -- traced to exactly this race
     (the quality-reporter and the watchdog's re-bind send landing at
-    close to the same moment, corrupting both)."""
+    close to the same moment, corrupting both).
+
+    A SECOND, more severe race in the same family, found later (via a
+    sustained ~100 pkt/s synthetic-traffic run, examples/drone_tui/
+    traffic.py, segfaulting the process after a few thousand frames):
+    `push_lock` here only ever protected the SOCKET WRITE, not the
+    `mac.ofdm.generate_frame()` call that produces `iq_frame` in the
+    first place. Every caller below (`_handle_decoded_pdu`'s bind-
+    response branch, `_stdin_send_loop`, `_quality_report_loop`) calls
+    generate_frame() on the SAME shared `mac.ofdm` instance from its own
+    thread -- and generate_frame() drives the native Viterbi/RS C
+    encoder structs (ctypes, GIL released for the call's duration,
+    exactly like the native DECODE path documented in Mac.
+    receive_iq_batch()'s own module docstring), which are NOT safe for
+    two threads to be inside concurrently. `push_lock` being held only
+    around `_send_chunks()` left a window where thread A could be mid-
+    generate_frame() while thread B entered it too, corrupting both --
+    silent most of the time, a segfault once unlucky enough. FIX: every
+    caller below now holds `push_lock` around generate_frame() AND
+    _send_chunks() together, as one critical section -- which is why
+    `push_lock` must be a threading.RLock() (see run(), below), not a
+    plain Lock: _send_chunks() re-acquires it internally, and a plain
+    Lock would deadlock on that nested acquisition from the same
+    thread."""
     samples = np.asarray(iq_frame)[0]  # (1, N) -> (N,), generate_frame()'s own batch dim
     with push_lock:
         for i in range(0, samples.shape[-1], CHUNK_SIZE):
@@ -174,8 +197,9 @@ def _handle_decoded_pdu(label, mac, bits, reply_push_socket, heartbeat, push_loc
         decision = evaluate_bind_request(request, local_max_segment_bits=mac.max_segment_bits)
         mac.bound = decision["accepted"]  # the real accept/reject decision, evaluated locally
         response_pdu = encode_bind_response(decision)
-        response_iq = mac.ofdm.generate_frame(response_pdu[None, :])
-        _send_chunks(reply_push_socket, response_iq, push_lock)
+        with push_lock:  # generate_frame() + _send_chunks() as one critical section -- see _send_chunks()'s docstring
+            response_iq = mac.ofdm.generate_frame(response_pdu[None, :])
+            _send_chunks(reply_push_socket, response_iq, push_lock)
         print(f"[{label}] BIND_REQUEST received, evaluated -- bound={mac.bound}")
 
     elif header["pdu_type"] == TYPE_BIND_RESPONSE:
@@ -219,8 +243,9 @@ def _stdin_send_loop(label, mac, push_socket, bound_event, push_lock):
             continue
         bound_event.wait()
         bits = np.unpackbits(np.frombuffer(line.encode("utf-8"), dtype="uint8"))
-        for iq_frame in mac.send_iq(bits):
-            _send_chunks(push_socket, iq_frame, push_lock)
+        with push_lock:  # see _send_chunks()'s docstring -- generate_frame() needs the lock too, not just the socket write
+            for iq_frame in mac.send_iq(bits):
+                _send_chunks(push_socket, iq_frame, push_lock)
         print(f"[{label}] sent: {line!r}")
 
 
@@ -234,8 +259,9 @@ def _quality_report_loop(label, mac, push_socket, bound_event, push_lock, interv
         time.sleep(interval_s)
         bound_event.wait()
         report_pdu = encode_quality_report(mac.quality.report_dict())
-        report_iq = mac.ofdm.generate_frame(report_pdu[None, :])
-        _send_chunks(push_socket, report_iq, push_lock)
+        with push_lock:  # see _send_chunks()'s docstring -- generate_frame() needs the lock too, not just the socket write
+            report_iq = mac.ofdm.generate_frame(report_pdu[None, :])
+            _send_chunks(push_socket, report_iq, push_lock)
 
 
 def _heartbeat_watchdog_loop(label, mac, bound_event, heartbeat, interval_s=LINK_QUALITY_INTERVAL_S):
@@ -287,7 +313,7 @@ def run(ground_ip: str = "127.0.0.1", verbose: bool = True):
 
     bound_event = threading.Event()
     heartbeat = {"received_count": 0}
-    push_lock = threading.Lock()  # see _send_chunks()'s docstring -- required, not optional
+    push_lock = threading.RLock()  # see _send_chunks()'s docstring -- required, not optional; RLock (not Lock) because callers now nest their own generate_frame()+_send_chunks() critical section around _send_chunks()'s own internal acquisition
 
     sender = threading.Thread(target=_stdin_send_loop, args=("air", air_mac, push, bound_event, push_lock), daemon=True)
     sender.start()
