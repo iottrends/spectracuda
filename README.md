@@ -2,6 +2,7 @@
 
 **Docs: [spectracuda.readthedocs.io](https://spectracuda.readthedocs.io/en/latest/)**
 
+AS the name suggest this is not CUDA READY yet. this is currently x86 and arm based optimizations only. i thought jetson will magically run the same code in cuda fast but later found we have to orchestrate cude kernels and orchestrator pipelines which makes sens but it is not there yet. 
 GPU-accelerated, liquid-dsp-inspired SDR PHY (+ MAC) framework for NVIDIA
 Jetson (Orin Nano first, NX/AGX Orin and desktop CUDA GPUs as additional
 targets).

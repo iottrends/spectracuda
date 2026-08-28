@@ -42,8 +42,10 @@ import numpy as np
 from ..block import Block
 from ._native import (
     NativeConvolutional,
+    NativeConvolutionalNEON,
     NativeConvolutionalSSE,
     native_available,
+    neon_available,
     sse_available,
 )
 
@@ -102,22 +104,33 @@ class ConvolutionalCode(Block):
         # SSE4.1 measured genuinely faster than the portable build (see
         # _native.py's own docstring) -- prefer it when available.
         #
-        # NEON did NOT: measured on real Pi 5 hardware (2026-08-27),
-        # this first NEON kernel's Viterbi decode was ~2.1x SLOWER than
-        # the plain portable build (7.92ms vs 3.72ms for the same
-        # ~24000-bit PDU) -- correct (30/30 correctness tests pass
-        # bit-exact) but a real regression, not a speedup, almost
-        # certainly because gathering table lookups through small stack
-        # scalar arrays before/after each 4-lane vector op adds more
-        # memory round-tripping than the ALU parallelism buys back at
-        # this width. So, UNLIKE sse_available(), neon_available() is
-        # deliberately NOT consulted here until a NEON kernel actually
-        # beats the portable build on real hardware -- unused for now
-        # (kept, and still exercised by tests/test_fec_native_
-        # acceleration.py's neon-specific tests, in case a future,
-        # wider/less memory-bound kernel replaces this one).
+        # NEON, first attempt, did NOT: measured on real Pi 5 hardware
+        # (2026-08-27), that first NEON kernel's Viterbi decode was
+        # ~2.1x SLOWER than the plain portable build (7.92ms vs 3.72ms
+        # for the same ~24000-bit PDU) -- correct (30/30 correctness
+        # tests pass bit-exact) but a real regression, almost certainly
+        # because gathering table lookups through small stack scalar
+        # arrays before/after each 4-lane (uint16x4_t) vector op added
+        # more memory round-tripping than the ALU parallelism bought
+        # back at that width.
+        #
+        # NEON, second attempt, DOES: widened to 8 lanes (uint16x8_t,
+        # two of the portable loop's outer-loop steps per NEON
+        # sequence) and replaced the stack-array round-trips with
+        # direct vld1q_u16 loads off the already-contiguous
+        # read_errors, a vld2q_u16 de-interleave for the gathered
+        # distance pairs, and vst2q_u16/vst2_u8 interleaved stores
+        # straight back into write_errors/history (see
+        # src/convolutional/neon/decode.c's own module comment for the
+        # full design). Measured on the same Pi 5 hardware, same
+        # ~24000-bit PDU, same day: ~2.38ms -- genuinely faster than
+        # the 3.72-3.80ms portable build (not just faster than the
+        # first NEON attempt), so unlike that first attempt this one
+        # earns being wired in here.
         if self.backend == "numpy" and sse_available():
             self._native = NativeConvolutionalSSE()
+        elif self.backend == "numpy" and neon_available():
+            self._native = NativeConvolutionalNEON()
         elif self.backend == "numpy" and native_available():
             self._native = NativeConvolutional()
         else:
