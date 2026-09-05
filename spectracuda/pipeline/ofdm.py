@@ -294,6 +294,7 @@ class Ofdm(Block):
         backend: Optional[BackendName] = None,
         iq_dtype: str = "float32",
         sync_threshold: Optional[float] = None,
+        strict_fec_check: bool = False,
     ) -> None:
         if fec != "none" and fec not in _FEC_SCHEME_CODES:
             raise ValueError(
@@ -331,6 +332,28 @@ class Ofdm(Block):
         self.fec = fec
         self.fec1 = fec1
         self.crc = crc
+        # Off by default -- preserves this class's existing, deliberately-
+        # tested "receiver is a separate device that never saw the
+        # transmitter's Ofdm(...) call, decode fec0/fec1 from the header
+        # alone" behavior (see tests/test_ofdm_class.py's
+        # test_rx_process_resolves_*_fec0_from_header_not_self_fec_codec
+        # and the LDPC/two-stage end-to-end tests). Opt into True for a
+        # receiver that should instead reject any decoded fec0/fec1 not
+        # equal to this object's own self.fec/self.fec1 -- see
+        # _decode_header_from_sync()'s own comment for why: it stops a
+        # false sync detection (SEEKING triggering on noise, no real
+        # frame at all) from constructing a fresh, potentially-expensive
+        # codec (LDPC's GF(2) matrix inversion above all -- measured as a
+        # real multi-hundred-ms-to-multi-second stall on a Raspberry Pi
+        # 5, see debug/pluto_rx_standalone_test.py) for a scheme this
+        # receiver was never going to legitimately see. True is the right
+        # choice for a receiver whose peer is known in advance to always
+        # use this exact fec/fec1 (e.g. this project's drone link, whose
+        # own adaptive-MCS controller -- examples/drone_tui/
+        # adaptive_mcs.py -- never varies fec/fec1 at all); leave False
+        # for a receiver that must stay generic across arbitrarily-
+        # configured senders.
+        self.strict_fec_check = strict_fec_check
         # interleaver choice is a deliberate EXCEPTION to the "resolve
         # from the wire" rule below -- it's never signaled in the
         # header (liquid-dsp doesn't signal its own interleaver's
@@ -545,12 +568,29 @@ class Ofdm(Block):
            Changing only what actually changed avoids paying it on every
            MCS transition for parameters that didn't move.
 
-        The RX side needs no corresponding change at all: rx_process()
-        already resolves mod_scheme/fec0/fec1 from the DECODED header,
-        never from self (see class docstring) -- a peer running an
-        unmodified Ofdm decodes a scheme-switched frame exactly as it
-        would any other frame from a DIFFERENT sender using a different
-        scheme, because that's the same code path either way.
+        A modem-only change needs no corresponding RX-side action:
+        rx_process()/rx_streaming() resolve mod_scheme from the DECODED
+        header, never from self, so an unmodified peer keeps decoding
+        fine, regardless of strict_fec_check (see __init__). A fec/fec1
+        change is DIFFERENT for a receiver constructed with
+        strict_fec_check=True: _decode_header_from_sync() rejects
+        (raises ValueError) any decoded fec0/fec1 that doesn't equal
+        that receiver's own self.fec/self.fec1 -- see __init__'s own
+        comment for why (constructing a codec, LDPC's GF(2) matrix
+        inversion above all, for whatever a false sync detection
+        decodes out of pure noise is a real, measured multi-hundred-ms-
+        to-multi-second stall on real hardware). A strict_fec_check=True
+        receiver whose peer DOES negotiate fec/fec1 changes over the air
+        (e.g. via LINK_QUALITY-driven scheme selection) must have
+        reconfigure_tx_scheme() called on BOTH ends' Ofdm -- the
+        sender's to change what it transmits, the receiver's to accept
+        what it now expects to decode -- not just the sender's. This
+        project's own adaptive-MCS controller, examples/drone_tui/
+        adaptive_mcs.py, sidesteps the whole question by only ever
+        varying modem, never fec/fec1.
+        A strict_fec_check=False receiver (the default) is unaffected by
+        any of this -- it keeps resolving fec0/fec1 from the header
+        alone, same as always.
 
         Returns the (possibly unchanged) `self.bits_per_ofdm_symbol` --
         callers with their own segmentation math derived from it (e.g.
@@ -917,19 +957,55 @@ class Ofdm(Block):
             header_bits_chunks.append(self.header_modem.demodulate(header_equalized))
         header_fields = self._decode_header_symbols(xp.concatenate(header_bits_chunks, axis=-1))
 
-        # Dynamically resolve the payload's modem AND crc/fec0/fec1
-        # composition from the DECODED header -- not from
-        # self.modem/self.packetizer. A real receiver is a separate
-        # device that never saw this object's constructor call (see
-        # class docstring). The Packetizer built here is throwaway/
-        # rx-only, mirroring self.packetizer's tx-side role but for
-        # whatever crc/fec0/fec1 the wire actually says -- EXCEPT
-        # interleaver, which is deliberately NOT resolved from the
-        # header (it's never signaled there -- see self.interleaver's
-        # own comment above and framing/packetizer.py's module
-        # docstring): this receiver must already be configured with the
-        # matching interleaver out-of-band, so THIS object's own
-        # self.interleaver/self.interleaver_kwargs are used here.
+        # strict_fec_check (see __init__'s own comment): reject any
+        # decoded fec0/fec1 this receiver wasn't itself configured for,
+        # BEFORE touching the codec cache/construction below -- cheap
+        # (two attribute comparisons), and it's what stops a false sync
+        # detection (SEEKING triggering on plain noise, no peer
+        # transmitting at all) from decoding garbage header bits into a
+        # random-but-VALID fec0 code -- FEC_SCHEME_CODES has 17 entries,
+        # 12 of them LDPC variants, so most such garbage draws land on
+        # one -- and paying for a full LDPCCode construction (GF(2)
+        # matrix inversion + edge-index tables, up to ~1.6s measured on
+        # a Pi 5 for the largest 1944-bit variant) to decode a frame
+        # that was never really there. Real-hardware root cause:
+        # debug/pluto_rx_standalone_test.py showed random multi-hundred-
+        # ms-to-multi-second rx_streaming() stalls with no TX active at
+        # all; profiled to LDPCCode.__init__ via _rx_payload_codec_cache
+        # thrashing on every such false positive (single-entry cache,
+        # keyed on the noise-derived fec0/fec1, essentially never hits).
+        #
+        # Off by default: the class's existing, deliberately-tested
+        # "receiver never needs to have seen the transmitter's own
+        # Ofdm(...) call" generality (tests/test_ofdm_class.py's
+        # dynamic-fec0-resolution tests) is preserved unless a caller
+        # opts in.
+        if self.strict_fec_check and (
+            header_fields["fec0"] != self.fec or header_fields["fec1"] != self.fec1
+        ):
+            raise ValueError(
+                f"decoded header fec0={header_fields['fec0']!r}/fec1={header_fields['fec1']!r} "
+                f"doesn't match this receiver's configured fec={self.fec!r}/fec1={self.fec1!r} "
+                f"-- rejecting before constructing a codec for it (strict_fec_check=True; "
+                f"likely a false sync detection decoding noise, not a real frame from a "
+                f"differently-configured peer)"
+            )
+
+        # Dynamically resolve the payload's modem AND crc composition
+        # from the DECODED header -- not from self.modem/self.packetizer.
+        # A real receiver is a separate device that never saw this
+        # object's constructor call (see class docstring). The
+        # Packetizer built here is throwaway/rx-only, mirroring
+        # self.packetizer's tx-side role but for whatever crc/fec0/fec1
+        # the wire actually says (fec0/fec1 already validated to match
+        # self.fec/self.fec1 above, so this is never a surprising
+        # scheme in practice) -- EXCEPT interleaver, which is
+        # deliberately NOT resolved from the header (it's never signaled
+        # there -- see self.interleaver's own comment above and
+        # framing/packetizer.py's module docstring): this receiver must
+        # already be configured with the matching interleaver out-of-
+        # band, so THIS object's own self.interleaver/self.interleaver_kwargs
+        # are used here.
         codec_key = (header_fields["mod_scheme"], header_fields["crc"], header_fields["fec0"], header_fields["fec1"])
         cached = self._rx_payload_codec_cache
         if cached is not None and cached[0] == codec_key:

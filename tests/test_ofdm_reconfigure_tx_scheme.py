@@ -4,10 +4,25 @@ the full "reconfigure, don't rebuild" rationale).
 
 What this suite exists to prove, each independently:
 1. A frame generated AFTER a scheme change decodes correctly on a
-   receiver Ofdm that was NEVER reconfigured -- the header's own
-   mod_scheme/fec0/fec1 fields (resolved from the wire, not from
-   self -- see Ofdm's class docstring) are what make this work, exactly
-   as it already does for two independently-configured Ofdm instances.
+   default (strict_fec_check=False) receiver Ofdm that was NEVER
+   reconfigured -- the header's own mod_scheme/fec0/fec1 fields
+   (resolved from the wire, not from self -- see Ofdm's class
+   docstring) are what make this work, exactly as it already does for
+   two independently-configured Ofdm instances.
+1b. The opt-in strict_fec_check=True mode (Ofdm.__init__) is the
+   opposite by design: a receiver constructed with it REJECTS any
+   decoded fec0/fec1 that doesn't equal its own self.fec/self.fec1 --
+   see _decode_header_from_sync()'s own comment for why (constructing a
+   codec, LDPC's GF(2) matrix inversion above all, for whatever a false
+   sync detection decodes out of pure noise is a real, measured multi-
+   hundred-ms-to-multi-second stall on real hardware -- see
+   debug/pluto_rx_standalone_test.py's own commit history) -- and
+   decodes fine again once the receiver is ALSO reconfigured to the
+   same fec/fec1, proving the "both ends must move together" mechanism
+   any future fec-negotiating feature would need. This project's own
+   adaptive-MCS controller, examples/drone_tui/adaptive_mcs.py, never
+   varies fec/fec1 in the first place (see 1. above), so opting into
+   strict_fec_check costs it nothing real.
 2. Fields NOT related to modem/fec/fec1 are untouched by a reconfigure
    (grid, header_codec, sync object identity, preamble, RX streaming
    buffer) -- this is what makes it safe on a full-duplex Mac's single
@@ -42,7 +57,7 @@ def _roundtrip_ok(tx: Ofdm, rx: Ofdm, bits: np.ndarray) -> bool:
 
 def test_reconfigured_frame_decodes_on_an_untouched_receiver():
     tx = Ofdm(modem="qpsk", fec="conv_v27", **_BASE)
-    rx = Ofdm(modem="qpsk", fec="conv_v27", **_BASE)  # never reconfigured
+    rx = Ofdm(modem="qpsk", fec="conv_v27", **_BASE)  # never reconfigured, default strict_fec_check=False
     bits = np.random.default_rng(1).integers(0, 2, size=800).astype("uint8")
 
     assert _roundtrip_ok(tx, rx, bits)  # baseline, before any change
@@ -57,6 +72,31 @@ def test_reconfigured_frame_decodes_on_an_untouched_receiver():
     tx.reconfigure_tx_scheme(modem="qam64")
     assert tx.fec == "rs_m8"
     assert tx.fec1 == "none"
+    assert _roundtrip_ok(tx, rx, bits)
+
+
+def test_strict_fec_check_rejects_fec_change_on_an_untouched_receiver():
+    """See module docstring point 1b."""
+    tx = Ofdm(modem="qpsk", fec="conv_v27", **_BASE)
+    rx = Ofdm(modem="qpsk", fec="conv_v27", strict_fec_check=True, **_BASE)  # never reconfigured
+    bits = np.random.default_rng(2).integers(0, 2, size=800).astype("uint8")
+
+    assert _roundtrip_ok(tx, rx, bits)  # baseline (fec still matches) still works under strict mode
+
+    tx.reconfigure_tx_scheme(fec="rs_m8")
+    iq = tx.generate_frame(bits[None, :])
+    with pytest.raises(ValueError, match="fec0"):
+        rx.rx_process(iq)
+
+
+def test_strict_fec_check_decodes_once_receiver_is_reconfigured_too():
+    """The other half of 1b: both ends moving together works fine."""
+    tx = Ofdm(modem="qpsk", fec="conv_v27", **_BASE)
+    rx = Ofdm(modem="qpsk", fec="conv_v27", strict_fec_check=True, **_BASE)
+    bits = np.random.default_rng(3).integers(0, 2, size=800).astype("uint8")
+
+    tx.reconfigure_tx_scheme(fec="rs_m8")
+    rx.reconfigure_tx_scheme(fec="rs_m8")  # the receiver must move too, not just the sender
     assert _roundtrip_ok(tx, rx, bits)
 
 
